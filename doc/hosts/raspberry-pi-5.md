@@ -168,6 +168,47 @@ On subsequent boots, the LiteX-M2SDR driver is automatically loaded:
 Example LiteX session:
 ![Running LiteX-M2SDR Tools on Raspberry Pi 5](https://github.com/user-attachments/assets/19198ebe-3898-4209-a208-2ebb1a2417c2)
 
+## Troubleshooting (DistributedSpectrum fork additions)
+
+The following issues were hit and root-caused while bringing up a Pi 5 + Pineboards HatDrive M.2 HAT from scratch. All three are config/driver issues on the host side, not board defects.
+
+### Ubuntu Server doesn't ship the `pciex1-compat-pi5` overlay
+
+This tutorial uses Raspberry Pi OS specifically because Ubuntu Server's arm64+raspi firmware package (as of 24.04.4) only ships `pcie-32bit-dma-pi5`/`pcie-32bit-dma`, not `pciex1-compat-pi5`. Without that overlay's `no-mip` option, driver probe fails outright:
+
+```
+m2sdr 0001:01:00.0: arch assigned 64-bit MSI address 0xffffffe000 but device only supports 32 bits
+m2sdr 0001:01:00.0: Failed to enable MSI
+m2sdr: probe of 0000:01:00.0 failed with error -5
+```
+
+The M2SDR's PCIe MSI capability is 32-bit-only, but BCM2712's PCIe root complex on the `pciex1` HAT slot defaults to targeting its 64-bit MSI-MIP peripheral. If you must use Ubuntu, fetch/compile `pciex1-compat-pi5-overlay.dts` from `raspberrypi/linux` yourself; otherwise use Raspberry Pi OS as above, which ships it natively.
+
+**Important:** despite this doc's example (`dtoverlay=pciex1-compat-pi5,l1ss=off,no-l0s=on,no-mip=off`), you need **`no-mip=on`**, not `off`, to fix this specific symptom. `no-mip` means "stop targeting the MSI-MIP peripheral," so it must be explicitly turned on for a 32-bit-only-MSI device like the M2SDR. Use:
+
+```
+dtoverlay=pciex1-compat-pi5,l1ss=off,no-l0s=on,no-mip=on
+```
+
+### `kernel=kernel8.img` is required for zero-copy DMA, not just a page-size nicety
+
+The `config.txt` snippet above lists `kernel=kernel8.img` with the note "ensures a standard 4K PAGE_SIZE instead of 16K" — this reads as cosmetic but is actually load-bearing. Raspberry Pi OS arm64 defaults to a 16K-page kernel (`+rpt-rpi-2712` flavor) unless this line forces the 4K-page `+rpt-rpi-v8` flavor instead. The kernel driver's zero-copy mmap path has its own sanity check:
+
+```c
+if (DMA_BUFFER_SIZE % PAGE_SIZE)
+    return -EINVAL;
+```
+
+`DMA_BUFFER_SIZE` is a compile-time `8192` (`kernel/config.h`). On a 16K-page kernel, `8192 % 16384 != 0`, so this check trips immediately and `m2sdr_util --zero-copy dma-test` fails with `MMAP failed` / dmesg `mmap failed for buffer 0 (ret=-22)` before any DMA is attempted. Do not skip `kernel=kernel8.img` — confirm with `getconf PAGE_SIZE` (should read `4096`) before debugging anything else DMA-related. If you change this after already building the kernel module, rebuild it against the new kernel flavor (`uname -r` will show `+rpt-rpi-v8` instead of `+rpt-rpi-2712`).
+
+### ARM/aarch64 zero-copy DMA needed a cache-coherency fix (included in this fork)
+
+Independent of the two issues above, this fork's `kernel/main.c` includes a fix for a real, upstream-unaddressed bug: the ARM/aarch64 branch of `litepcie_mmap()` never received the `dev_is_dma_coherent()`/`pgprot_dmacoherent()` handling that the non-ARM path got upstream (see commits `8dd2a02`, `f0f62d7`, `422d630`, `e0404f1`). It mapped coherent DMA buffers with a plain cached `remap_pfn_range()`, relying on a comment telling userspace to "explicitly flush the CPU caches" — something neither the kernel driver nor any userspace tool actually does.
+
+On a Pi 5, the PCIe host bridge has no `dma-coherent` devicetree property (check via `find /sys/firmware/devicetree/base/axi -iname 'pcie@*'` and inspect the node), meaning its DMA is genuinely not hardware-cache-coherent — exactly the condition the missing fix needs to handle. Without it, zero-copy DMA silently maps stale/incoherent memory into userspace. This fork's `litepcie_mmap()` unifies the ARM and non-ARM paths through the same coherency-aware helpers, using `remap_pfn_range()` (not `vm_insert_page()`, which fails with `-EINVAL` against the `PG_reserved`, zero-refcount pages that non-cache-coherent platforms' `dma_alloc_coherent()` typically returns).
+
+With all three fixes applied, `m2sdr_util --duration 10 --zero-copy dma-test` sustains ~2.9-3.6 Gbps with 0 errors across 460,000+ buffers on a Pi 5.
+
 ## Buildroot
 
 *TBD*
