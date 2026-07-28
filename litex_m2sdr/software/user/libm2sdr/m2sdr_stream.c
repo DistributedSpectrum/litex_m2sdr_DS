@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "config.h"
 #include "csr.h"
@@ -857,6 +858,19 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
         return M2SDR_ERR_INVAL;
     if (direction != M2SDR_RX && direction != M2SDR_TX)
         return M2SDR_ERR_INVAL;
+
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    if (dev->transport == M2SDR_TRANSPORT_LITEPCIE) {
+        uint32_t bypass_val = 0xdeadbeef;
+        int rc = m2sdr_reg_read(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, &bypass_val);
+        fprintf(stderr, "[BYPASSDBG] at stream_activate(dir=%d): bypass_reg=0x%x (rc=%d), zero_copy=%d, rx_configured=%d\n",
+                direction, bypass_val, rc, dev->zero_copy, dev->rx_configured);
+        if (bypass_val != 1) {
+            fprintf(stderr, "[BYPASSDBG] re-asserting bypass=1\n");
+            m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+        }
+    }
+#endif
 
     if (dev->transport == M2SDR_TRANSPORT_LITEPCIE) {
         /* The kernel clears its ring counters across a stop/start cycle, so
