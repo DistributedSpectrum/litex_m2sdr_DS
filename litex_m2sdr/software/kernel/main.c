@@ -1041,6 +1041,14 @@ static pgprot_t litepcie_dma_buffer_pgprot(struct device *dev, pgprot_t prot)
 /* Map the per-buffer coherent allocations into one userspace VMA without
  * using copied sub-VMAs: the PTEs must be installed with PFNMAP metadata on
  * the real VMA so munmap() can tear the mapping down cleanly.
+ *
+ * remap_pfn_range() (not vm_insert_page()) is required here: on platforms
+ * without cache-coherent DMA, dma_alloc_coherent() commonly returns pages
+ * from a reserved/atomic coherent pool with PG_reserved set, which have a
+ * permanent page_count() of 0. vm_insert_page() rejects such pages outright
+ * (-EINVAL from its own !page_count(page) check) because it is meant for
+ * ordinary refcounted memory; remap_pfn_range()'s VM_PFNMAP-style PTEs carry
+ * no page refcount and are exactly what reserved coherent-pool memory needs.
  */
 static int litepcie_dma_buffer_mmap(struct device *dev, struct vm_area_struct *vma,
 				    unsigned long user_addr, void *cpu_addr)
@@ -1071,12 +1079,7 @@ static int litepcie_mmap(struct file *file, struct vm_area_struct *vma)
 	struct litepcie_chan_priv *chan_priv = file->private_data;
 	struct litepcie_chan *chan = chan_priv->chan;
 	struct litepcie_device *s = chan->litepcie_dev;
-#if defined(__arm__) || defined(__aarch64__)
-	unsigned long pfn;
-#else
-	int ret;
-#endif
-	int is_tx, i;
+	int is_tx, i, ret;
 
 	if (vma->vm_end - vma->vm_start != DMA_BUFFER_TOTAL_SIZE)
 		return -EINVAL;
@@ -1089,29 +1092,7 @@ static int litepcie_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 
 	for (i = 0; i < DMA_BUFFER_COUNT; i++) {
-#if defined(__arm__) || defined(__aarch64__)
-		void *va;
-		if (i == 0)
-			dev_info(&s->dev->dev, "Using ARM/AArch64 DMA buffer handling");
-		if (is_tx)
-			va = phys_to_virt(dma_to_phys(&s->dev->dev, chan->dma.reader_handle[i]));
-		else
-			va = phys_to_virt(dma_to_phys(&s->dev->dev, chan->dma.writer_handle[i]));
-		pfn = page_to_pfn(virt_to_page(va));
-		/*
-		 * Note: the memory is cached, so the user must explicitly
-		 * flush the CPU caches on architectures which require it.
-		 */
-		if (remap_pfn_range(vma, vma->vm_start + i * DMA_BUFFER_SIZE, pfn,
-					DMA_BUFFER_SIZE, vma->vm_page_prot)) {
-			dev_err(&s->dev->dev, "mmap remap_pfn_range failed\n");
-			return -EAGAIN;
-		}
-#else
 		void *cpu_addr;
-
-		if (i == 0)
-			dev_info(&s->dev->dev, "Using non-ARM DMA buffer handling");
 
 		if (is_tx)
 			cpu_addr = chan->dma.reader_addr[i];
@@ -1123,10 +1104,9 @@ static int litepcie_mmap(struct file *file, struct vm_area_struct *vma)
 					       cpu_addr);
 		if (ret) {
 			dev_err(&s->dev->dev,
-				"mmap remap_pfn_range failed for buffer %d (ret=%d)\n", i, ret);
+				"mmap failed for buffer %d (ret=%d)\n", i, ret);
 			return ret;
 		}
-#endif
 	}
 
 	return 0;
