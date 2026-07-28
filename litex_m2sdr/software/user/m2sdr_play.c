@@ -355,6 +355,16 @@ static void m2sdr_play(const char *device_id, const char *filename, uint32_t loo
         }
         dma.reader_enable = 1;
         use_pcie_dma = true;
+
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+        {
+            uint32_t bypass_val = 0xdeadbeef;
+
+            m2sdr_reg_read(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, &bypass_val);
+            if (bypass_val != 1)
+                m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+        }
+#endif
     } else
 #endif
     {
@@ -445,6 +455,16 @@ static void m2sdr_play(const char *device_id, const char *filename, uint32_t loo
 
                 prepare_play_metadata(raw_buf, header_bytes, &meta);
                 fill_play_dma_frame((uint8_t *)dma_buf, raw_buf, frame_bytes, header_bytes, &meta);
+
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+                if ((dma.reader_sw_count & 0xff) == 0) {
+                    uint32_t bypass_val = 0xdeadbeef;
+
+                    m2sdr_reg_read(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, &bypass_val);
+                    if (bypass_val != 1)
+                        m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+                }
+#endif
             }
             total_buffers = (uint64_t)dma.reader_sw_count;
         } else
