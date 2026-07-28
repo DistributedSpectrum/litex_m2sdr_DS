@@ -206,6 +206,19 @@ On a Pi 5, the PCIe host bridge has no `dma-coherent` devicetree property (check
 
 With all three fixes applied, `m2sdr_util --duration 10 --zero-copy dma-test` sustains ~2.9-3.6 Gbps with 0 errors across 460,000+ buffers on a Pi 5.
 
+### Real (non-loopback) streaming — GNU Radio/SoapySDR/`m2sdr_record`/`m2sdr_rf` — needed two more fixes (included in this fork, not Pi 5-specific)
+
+These two bugs affect `libm2sdr` on any host, not just Pi 5, but were found here while bringing up `test_rx.grc`. If real RX/TX capture shows **zero** buffers and **zero** MSI interrupt increments indefinitely (check `/proc/interrupts` before/after a capture attempt) while `m2sdr_util dma-test`'s internal loopback works fine, this is almost certainly it — that internal test hits the raw DMA engine directly and never exercises either bug below.
+
+1. `dev->zero_copy` was never defaulted to `1` anywhere, so the sync API's (`m2sdr_sync_config`/`m2sdr_sync_rx`/`m2sdr_sync_tx`) DMA-arming calls, which only run in their `if (dev->zero_copy)` branches, were dead code.
+2. `header.rx`/`header.tx` — which all real streaming goes through — stay held in gateware reset until the shared, PPS-driven `pcie_dma0.synchronizer` reports synced. No current tool drives that handshake to completion, so real streaming waited forever. Fixed by unconditionally setting `CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR = 1` in `m2sdr_open()` — the gateware itself documents this bypass as the intended software escape hatch for exactly this case.
+
+Both are fixed in `m2sdr_open()` (`libm2sdr/m2sdr_device.c`), so every tool and the SoapySDR module (which links against `libm2sdr`) picks them up automatically — no per-tool changes needed.
+
+**Known remaining gap, not fixed**: `m2sdr_record`/`m2sdr_play` hardcode `zero_copy=0` in their own separate raw `litepcie_dma_init()` calls (a code path that bypasses the sync API and the fixes above), so they still use the slower non-zero-copy DMA path and can show ring overflows under sustained high-rate capture. SoapySDR/GNU Radio are unaffected (they go through the sync API, not this raw path).
+
+**Unrelated gotcha, not a bug**: if a previous `m2sdr_util`/similar process gets left suspended (Ctrl-Z, `ps` shows state `T`) instead of terminated, it keeps `/dev/m2sdr0` open and the next invocation fails with a misleading `DMA not available`. Check `sudo lsof /dev/m2sdr0` and `kill -9` the stale PID first before assuming a real regression.
+
 ## Buildroot
 
 *TBD*
