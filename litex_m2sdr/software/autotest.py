@@ -98,7 +98,13 @@ def get_board_variant():
 
 def verify_pcie_speed(device_id):
     try:
-        device_path = f"/sys/bus/pci/devices/0000:{device_id}"
+        # lspci omits the domain when it's the default 0000, but includes it
+        # otherwise (e.g. "0002:21:00.0" on hosts with multiple PCIe root
+        # domains, such as this Rockchip SoC). Only prepend the default
+        # domain when device_id doesn't already have one, otherwise this
+        # builds an invalid doubled-domain path.
+        bdf = device_id if device_id.count(":") > 1 else f"0000:{device_id}"
+        device_path = f"/sys/bus/pci/devices/{bdf}"
         current_link_speed = subprocess.check_output(f"cat {device_path}/current_link_speed", shell=True).decode().strip()
         current_link_width = subprocess.check_output(f"cat {device_path}/current_link_width", shell=True).decode().strip()
 
