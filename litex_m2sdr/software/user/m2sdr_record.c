@@ -459,6 +459,7 @@ static void m2sdr_record(const char *device_id, const char *filename, size_t siz
     int64_t last_time;
     uint64_t total_buffers = 0;
     uint64_t last_buffers  = 0;
+    uint64_t reported_overflow_events = 0;
     uint64_t last_timestamp = 0;
     uint64_t first_timestamp = 0;
     uint64_t prev_timestamp = 0;
@@ -562,6 +563,13 @@ static void m2sdr_record(const char *device_id, const char *filename, size_t siz
 #ifdef USE_LITEPCIE
         if (use_pcie_dma) {
             litepcie_dma_process(&dma);
+            if (dma.writer_overflow_events != reported_overflow_events) {
+                fprintf(stderr,
+                        "warning: RX ring overflow, %" PRIu64 " buffer(s) dropped"
+                        " (capture can't keep up with the sample rate at this destination/rate)\n",
+                        dma.writer_overflow_buffers);
+                reported_overflow_events = dma.writer_overflow_events;
+            }
             while (!stop) {
                 if (header) {
                     const uint8_t *rx_data;

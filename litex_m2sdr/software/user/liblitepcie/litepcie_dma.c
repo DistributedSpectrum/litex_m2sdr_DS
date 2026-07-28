@@ -191,9 +191,30 @@ void litepcie_dma_process(struct litepcie_dma_ctrl *dma)
     /* read event */
     if (dma->fds.revents & POLLIN) {
         if (dma->zero_copy) {
-            /* count available buffers */
-            dma->buffers_available_read = dma->writer_hw_count - dma->writer_sw_count;
-            dma->usr_read_buf_offset = dma->writer_sw_count % DMA_BUFFER_COUNT;
+            /* Zero-copy hands out pointers straight into the kernel ring,
+             * which the hardware free-runs through with no backpressure:
+             * litepcie_dma_next_read_run()/next_read_buffer() only know
+             * about buffers_available_read, not whether the hardware has
+             * already lapped and overwritten them. If the caller falls
+             * behind enough that the unread backlog exceeds half the ring,
+             * treat it as an overflow: skip ahead to the current hw
+             * position (discarding the now-unsafe-to-read backlog) rather
+             * than silently handing out stale/overwritten data as if it
+             * were valid. Half the ring (not the full ring) matches the
+             * safety margin already used by m2sdr_stream.c's newer stream
+             * API (m2sdr_wait_rx_buffer()). */
+            int64_t backlog = dma->writer_hw_count - dma->writer_sw_count;
+
+            if (backlog > (int64_t)DMA_BUFFER_COUNT / 2) {
+                dma->writer_overflow_events++;
+                dma->writer_overflow_buffers += (uint64_t)backlog;
+                dma->writer_sw_count = dma->writer_hw_count;
+                dma->buffers_available_read = 0;
+                dma->usr_read_buf_offset = dma->writer_sw_count % DMA_BUFFER_COUNT;
+            } else {
+                dma->buffers_available_read = (unsigned)backlog;
+                dma->usr_read_buf_offset = dma->writer_sw_count % DMA_BUFFER_COUNT;
+            }
 
             /* update dma sw_count*/
             dma->mmap_dma_update.sw_count = dma->writer_sw_count + dma->buffers_available_read;

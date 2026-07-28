@@ -26,6 +26,10 @@ struct litepcie_dma_ctrl {
     int64_t writer_hw_count, writer_sw_count;
     unsigned buffers_available_read, buffers_available_write;
     unsigned usr_read_buf_offset, usr_write_buf_offset;
+    /* Zero-copy RX ring safety: incremented when litepcie_dma_process()
+     * finds the unread backlog exceeding half the ring (DMA_BUFFER_COUNT/2)
+     * before it becomes stale. See that function's comment. */
+    uint64_t writer_overflow_events, writer_overflow_buffers;
     /* TX staging cursors: buffers filled by the user vs flushed to the
      * kernel. Monotonic; slot = count % DMA_BUFFER_COUNT. */
     uint64_t usr_write_fill_count, usr_write_flush_count;
