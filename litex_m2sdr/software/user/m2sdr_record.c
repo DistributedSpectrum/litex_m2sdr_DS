@@ -300,42 +300,82 @@ static size_t record_payload_len(size_t payload_bytes_per_buf, size_t size, size
     return to_write;
 }
 
+/* Batch popped DMA slots into large sequential writes: a write() per
+ * DMA_BUFFER_SIZE (8KB) chunk caps out well below the disk's real sequential
+ * throughput (measured ~120MB/s vs. ~250MB/s at 2MB write granularity),
+ * which is the difference between keeping up with high sample rates and not. */
+#define RECORD_WRITE_BATCH_SIZE (2 * 1024 * 1024)
+
+/* How many contiguous DMA_BUFFER_SIZE ring slots to hand off per
+ * litepcie_dma_next_read_run() call (see that function's comment for why
+ * per-buffer overhead matters at high sample rates in zero-copy mode). Also
+ * used as the host-queue slot size so batching survives the --host-buffers
+ * path too. */
+#define RECORD_RUN_MAX_BUFFERS 128
+#define RECORD_QUEUE_SLOT_SIZE ((size_t)RECORD_RUN_MAX_BUFFERS * DMA_BUFFER_SIZE)
+
 static void *m2sdr_record_sink_worker(void *arg)
 {
     struct m2sdr_record_sink *sink = arg;
-    uint8_t buf[DMA_BUFFER_SIZE];
+    uint8_t *batch = malloc(RECORD_WRITE_BATCH_SIZE);
+    size_t batch_len = 0;
+    bool closed = false;
 
-    while (1) {
-        size_t len = 0;
-        int rc = m2sdr_host_queue_pop(&sink->queue, buf, sizeof(buf), &len, NULL);
-
-        if (rc == M2SDR_HOST_QUEUE_CLOSED)
-            break;
-        if (rc != M2SDR_HOST_QUEUE_OK) {
-            if (rc != M2SDR_HOST_QUEUE_STOPPED)
-                sink->error = 1;
-            break;
-        }
-
-        if (sink->fo && fwrite(buf, 1, len, sink->fo) != len) {
-            perror("fwrite");
-            sink->error = 1;
-            m2sdr_host_queue_stop(&sink->queue);
-            break;
-        }
-        sink->bytes_written += len;
+    if (!batch) {
+        sink->error = 1;
+        return NULL;
     }
 
+    while (!closed) {
+        size_t len = 0;
+        int rc = m2sdr_host_queue_pop(&sink->queue, batch + batch_len,
+                                      RECORD_WRITE_BATCH_SIZE - batch_len, &len, NULL);
+
+        if (rc == M2SDR_HOST_QUEUE_OK) {
+            batch_len += len;
+        } else if (rc == M2SDR_HOST_QUEUE_CLOSED) {
+            closed = true;
+        } else {
+            if (rc != M2SDR_HOST_QUEUE_STOPPED)
+                sink->error = 1;
+            free(batch);
+            return NULL;
+        }
+
+        if (batch_len > 0 &&
+            (batch_len + RECORD_QUEUE_SLOT_SIZE > RECORD_WRITE_BATCH_SIZE || closed)) {
+            if (sink->fo && fwrite(batch, 1, batch_len, sink->fo) != batch_len) {
+                perror("fwrite");
+                sink->error = 1;
+                m2sdr_host_queue_stop(&sink->queue);
+                free(batch);
+                return NULL;
+            }
+            sink->bytes_written += batch_len;
+            batch_len = 0;
+        }
+    }
+
+    free(batch);
     return NULL;
 }
 
 static int m2sdr_record_sink_start(struct m2sdr_record_sink *sink, FILE *fo, unsigned host_buffers)
 {
+    unsigned slots;
+
     memset(sink, 0, sizeof(*sink));
     if (!fo || host_buffers == 0)
         return 0;
 
-    if (m2sdr_host_queue_init(&sink->queue, host_buffers, DMA_BUFFER_SIZE) != M2SDR_HOST_QUEUE_OK)
+    /* host_buffers is expressed in DMA_BUFFER_SIZE units for CLI/RAM-budget
+     * compatibility; translate to slots of RECORD_QUEUE_SLOT_SIZE so the
+     * total buffered bytes stay ~the same regardless of batch size. */
+    slots = host_buffers / RECORD_RUN_MAX_BUFFERS;
+    if (slots == 0)
+        slots = 1;
+
+    if (m2sdr_host_queue_init(&sink->queue, slots, RECORD_QUEUE_SLOT_SIZE) != M2SDR_HOST_QUEUE_OK)
         return -1;
     sink->fo = fo;
     sink->enabled = 1;
@@ -489,7 +529,7 @@ static void m2sdr_record(const char *device_id, const char *filename, size_t siz
         dma.use_writer = 1;
         dma.shared_fd  = 1;
         dma.fds.fd     = fd;
-        if (litepcie_dma_init(&dma, NULL, 0) != 0) {
+        if (litepcie_dma_init(&dma, NULL, 1) != 0) {
             fprintf(stderr, "litepcie_dma_init failed\n");
             goto cleanup;
         }
@@ -523,34 +563,57 @@ static void m2sdr_record(const char *device_id, const char *filename, size_t siz
         if (use_pcie_dma) {
             litepcie_dma_process(&dma);
             while (!stop) {
-                const uint8_t *rx_data;
-                char *dma_buf = litepcie_dma_next_read_buffer(&dma);
-
-                if (!dma_buf)
-                    break;
-                if (size > 0 && total_len >= size) {
-                    stop = true;
-                    break;
-                }
-
-                rx_data = (const uint8_t *)dma_buf;
                 if (header) {
-                    uint64_t ts = 0;
+                    const uint8_t *rx_data;
+                    char *dma_buf = litepcie_dma_next_read_buffer(&dma);
 
-                    if (m2sdr_tool_parse_dma_header((const uint8_t *)dma_buf, &ts)) {
-                        record_note_timestamp(ts, total_len, sample_size, samples_per_buf,
-                                              sigmf_enable, annotate_ts_jumps, ts_jump_threshold_pct,
-                                              sigmf_meta, &last_timestamp, &first_timestamp,
-                                              &prev_timestamp, &nominal_dt);
+                    if (!dma_buf)
+                        break;
+                    if (size > 0 && total_len >= size) {
+                        stop = true;
+                        break;
                     }
-                    if (strip_header)
-                        rx_data += 16;
-                }
 
-                if (!record_submit_payload(fo, &sink, rx_data, payload_bytes_per_buf,
-                                           size, &total_len)) {
-                    stop = true;
-                    break;
+                    rx_data = (const uint8_t *)dma_buf;
+                    {
+                        uint64_t ts = 0;
+
+                        if (m2sdr_tool_parse_dma_header((const uint8_t *)dma_buf, &ts)) {
+                            record_note_timestamp(ts, total_len, sample_size, samples_per_buf,
+                                                  sigmf_enable, annotate_ts_jumps, ts_jump_threshold_pct,
+                                                  sigmf_meta, &last_timestamp, &first_timestamp,
+                                                  &prev_timestamp, &nominal_dt);
+                        }
+                        if (strip_header)
+                            rx_data += 16;
+                    }
+
+                    if (!record_submit_payload(fo, &sink, rx_data, payload_bytes_per_buf,
+                                               size, &total_len)) {
+                        stop = true;
+                        break;
+                    }
+                } else {
+                    /* No per-buffer header to inspect: hand off a whole
+                     * contiguous run of ring slots in one shot. See
+                     * litepcie_dma_next_read_run()'s comment for why this
+                     * matters at high sample rates in zero-copy mode. */
+                    size_t run_count = 0;
+                    char *run_buf = litepcie_dma_next_read_run(&dma, RECORD_RUN_MAX_BUFFERS, &run_count);
+
+                    if (!run_buf)
+                        break;
+                    if (size > 0 && total_len >= size) {
+                        stop = true;
+                        break;
+                    }
+
+                    if (!record_submit_payload(fo, &sink, run_buf,
+                                               run_count * (size_t)DMA_BUFFER_SIZE,
+                                               size, &total_len)) {
+                        stop = true;
+                        break;
+                    }
                 }
 
                 total_buffers = (uint64_t)dma.writer_sw_count;

@@ -349,7 +349,7 @@ static void m2sdr_play(const char *device_id, const char *filename, uint32_t loo
         dma.use_reader = 1;
         dma.shared_fd  = 1;
         dma.fds.fd     = fd;
-        if (litepcie_dma_init(&dma, NULL, 0) != 0) {
+        if (litepcie_dma_init(&dma, NULL, 1) != 0) {
             fprintf(stderr, "litepcie_dma_init failed\n");
             goto cleanup;
         }

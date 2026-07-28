@@ -12,6 +12,7 @@
 #define LITEPCIE_LIB_DMA_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <poll.h>
 #include "litepcie.h"
 
@@ -43,6 +44,7 @@ int litepcie_dma_init(struct litepcie_dma_ctrl *dma, const char *device_name, ui
 void litepcie_dma_cleanup(struct litepcie_dma_ctrl *dma);
 void litepcie_dma_process(struct litepcie_dma_ctrl *dma);
 char *litepcie_dma_next_read_buffer(struct litepcie_dma_ctrl *dma);
+char *litepcie_dma_next_read_run(struct litepcie_dma_ctrl *dma, size_t max_count, size_t *count);
 char *litepcie_dma_next_write_buffer(struct litepcie_dma_ctrl *dma);
 
 #endif /* LITEPCIE_LIB_DMA_H */

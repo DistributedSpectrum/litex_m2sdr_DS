@@ -264,6 +264,38 @@ char *litepcie_dma_next_read_buffer(struct litepcie_dma_ctrl *dma)
     return ret;
 }
 
+/* Return a pointer to a contiguous run of available read buffers (bounded by
+ * the ring wrap point) and advance internal state by that many in one step.
+ * In zero-copy mode the kernel ring has no backpressure: litepcie_dma_process()
+ * marks the whole batch consumed up front, so at high sample rates the
+ * per-buffer call/lock overhead of draining one DMA_BUFFER_SIZE slot at a
+ * time can fail to keep up with the hardware, which then silently overwrites
+ * ring slots the caller hasn't read yet. Handing out a whole contiguous run
+ * at once lets the caller do one large copy/write instead of many small
+ * ones, cutting that per-buffer overhead proportionally. */
+char *litepcie_dma_next_read_run(struct litepcie_dma_ctrl *dma, size_t max_count, size_t *count)
+{
+    unsigned contig;
+    char *ret;
+
+    if (!dma->buffers_available_read) {
+        *count = 0;
+        return NULL;
+    }
+
+    contig = DMA_BUFFER_COUNT - dma->usr_read_buf_offset;
+    if (contig > dma->buffers_available_read)
+        contig = dma->buffers_available_read;
+    if (max_count > 0 && contig > max_count)
+        contig = (unsigned)max_count;
+
+    ret = dma->buf_rd + (size_t)dma->usr_read_buf_offset * DMA_BUFFER_SIZE;
+    dma->usr_read_buf_offset = (dma->usr_read_buf_offset + contig) % DMA_BUFFER_COUNT;
+    dma->buffers_available_read -= contig;
+    *count = contig;
+    return ret;
+}
+
 /* Push user-filled TX staging buffers to the kernel (non zero-copy mode).
  * Writes exactly the [flush, fill) cursor range, honoring partial accepts.
  * The blocking write() at the kernel queue high-water mark provides natural
