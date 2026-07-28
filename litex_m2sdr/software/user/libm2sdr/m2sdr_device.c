@@ -743,6 +743,11 @@ int m2sdr_open(struct m2sdr_dev **dev_out, const char *device_identifier)
         return M2SDR_ERR_NO_MEM;
 
     dev->fd = -1;
+    /* The sync API (m2sdr_sync_config/m2sdr_sync_rx/m2sdr_sync_tx) only arms
+     * the LitePCIe DMA writer/reader channel in its zero_copy branches; the
+     * non-zero-copy branches were never implemented. zero_copy must default
+     * to on for any real streaming to happen at all. */
+    dev->zero_copy = 1;
     pthread_mutex_init(&dev->reg_lock, NULL);
 
     rc = m2sdr_resolve_device_identifier(device_identifier, &addr);
@@ -762,6 +767,19 @@ int m2sdr_open(struct m2sdr_dev **dev_out, const char *device_identifier)
         }
 
         snprintf(dev->device_path, sizeof(dev->device_path), "%s", addr.path);
+
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+        /* header.rx/header.tx (and therefore all real, non-loopback PCIe
+         * streaming) stay held in reset until pcie_dma0.synchronizer.synced
+         * goes high, which only happens once the shared PPS-derived
+         * synchronizer completes its handshake. No current tool drives that
+         * handshake to completion (confirmed: RX-only streaming produced
+         * zero interrupts and zero buffers indefinitely, while the
+         * synchronizer-bypassing internal DMA loopback test worked fine).
+         * Bypass the wait unconditionally; real streaming has no other way
+         * to start today. */
+        (void)m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
     } else {
         char port_str[16];
 
