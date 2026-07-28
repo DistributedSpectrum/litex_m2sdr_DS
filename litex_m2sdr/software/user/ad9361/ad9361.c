@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 #include "ad9361.h"
 #include "platform.h"
 #include "util.h"
@@ -1324,14 +1325,23 @@ static int32_t ad9361_check_cal_done(struct ad9361_rf_phy *phy, uint32_t reg,
 				     uint32_t mask, uint32_t done_state)
 {
 	uint32_t timeout = 20000; /* RFDC_CAL can take long */
+	uint32_t start_timeout = timeout;
 	int32_t state;
+	struct timespec ts0, ts1;
+	clock_gettime(CLOCK_MONOTONIC, &ts0);
 
 	do {
 		state = ad9361_spi_readf(phy->spi, reg, mask);
 		if (state < 0)
 			return state;
-		if ((uint32_t)state == done_state)
+		if ((uint32_t)state == done_state) {
+			clock_gettime(CLOCK_MONOTONIC, &ts1);
+			double elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 +
+					    (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+			fprintf(stderr, "[CALDBG] reg=0x%03x mask=0x%02x done after %u/%u iters, %.2f ms\n",
+				reg, mask, start_timeout - timeout, start_timeout, elapsed_ms);
 			return 0;
+		}
 
 		if (reg == REG_CALIBRATION_CTRL)
 			udelay(1200);
