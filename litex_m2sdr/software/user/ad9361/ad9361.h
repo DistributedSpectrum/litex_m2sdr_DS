@@ -2822,9 +2822,9 @@ extern "C" {
 #define MAX_LPF_GAIN			24
 #define MAX_DIG_GAIN			31
 
-#define MAX_BBPLL_FREF			70000000UL /* 70 MHz */
-#define MIN_BBPLL_FREQ			715000000UL /* 715 MHz */
-#define MAX_BBPLL_FREQ			1430000000UL /* 1430 MHz */
+#define MAX_BBPLL_FREF			70007000UL /* 70 MHz + 100ppm */
+#define MIN_BBPLL_FREQ			714928500UL /* 715 MHz - 100ppm */
+#define MAX_BBPLL_FREQ			1430143000UL /* 1430 MHz + 100ppm */
 #define MAX_BBPLL_DIV			64
 #define MIN_BBPLL_DIV			2
 
@@ -2838,6 +2838,16 @@ extern "C" {
 //#define MIN_ADC_CLK			(MIN_BBPLL_FREQ / MAX_BBPLL_DIV) /* 11.17MHz */
 #define MAX_ADC_CLK			640000000UL /* 640 MHz */
 #define MAX_DAC_CLK			(MAX_ADC_CLK / 2)
+
+#define MAX_RX_HB1			245760000UL
+#define MAX_RX_HB2			320000000UL
+#define MAX_RX_HB3			640000000UL
+
+#define MAX_TX_HB1			160000000UL
+#define MAX_TX_HB2			320000000UL
+#define MAX_TX_HB3			320000000UL
+
+#define MAX_BASEBAND_RATE		61440000UL
 
 #define MAX_MBYTE_SPI			8
 
