@@ -943,6 +943,188 @@ static bool m2sdr_pick_delay_midpoint(const unsigned valid[M2SDR_DELAY_TAPS][M2S
     return true;
 }
 
+/* Longest run of valid entries in a 1-D field; returns its length and start. */
+static unsigned m2sdr_find_longest_run(const unsigned *field, unsigned n, unsigned *start)
+{
+    unsigned i = 0;
+    unsigned longest = 0;
+    unsigned chosen = 0;
+
+    while (i < n) {
+        unsigned s;
+
+        while (i < n && !field[i])
+            i++;
+        if (i >= n)
+            break;
+        s = i;
+        while (i < n && field[i])
+            i++;
+        if ((i - s) > longest) {
+            longest = i - s;
+            chosen = s;
+        }
+    }
+
+    if (start)
+        *start = chosen;
+    return longest;
+}
+
+/* Edge scan: only the RELATIVE delay between the clock and data lines affects
+ * interface timing, so probing the full M2SDR_DELAY_TAPS^2 matrix is
+ * redundant - each row of that matrix is the previous one shifted by one tap
+ * (which is exactly the triangular valid/invalid boundary the full scan
+ * prints). Sweeping data 0..15 at clock 0, then data 15..0 at clock 15,
+ * covers the same -15..+15 span of relative delay in 2*16 probes instead of
+ * 16*16: an 8x reduction in scan time. This mirrors ad9361_dig_tune_delay()
+ * in the reference no-OS driver, which is what bladeRF uses on this RFIC.
+ *
+ *   field[0][j] = clock 0,  data j      (relative delay +j)
+ *   field[1][j] = clock 15, data 15 - j (relative delay -j)
+ */
+static int m2sdr_scan_delay_edges(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy,
+                                  bool tx, unsigned rx_clk_delay, unsigned rx_data_delay,
+                                  unsigned field[2][M2SDR_DELAY_TAPS], bool verbose)
+{
+    const char *label = tx ? "TX" : "RX";
+    unsigned edge;
+    unsigned j;
+
+    if (verbose) {
+        printf("\n%s Clk/Dat delays scan (edges)...\n", label);
+        printf("--------------------------------\n");
+        printf("Edge    |  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15\n");
+    }
+
+    for (edge = 0; edge < 2; edge++) {
+        if (verbose)
+            printf(" %-6s |", edge ? "clk+" : "dat+");
+
+        for (j = 0; j < M2SDR_DELAY_TAPS; j++) {
+            const unsigned clk  = edge ? (M2SDR_DELAY_TAPS - 1) : 0;
+            const unsigned data = edge ? (M2SDR_DELAY_TAPS - 1 - j) : j;
+            bool synced = false;
+            int rc;
+
+            /* TX tuning sweeps the TX interface against the already-selected
+             * RX delay, so re-assert the RX side first (as the full scan does). */
+            if (tx) {
+                rc = m2sdr_program_delay_reg(phy, false, rx_clk_delay, rx_data_delay, j == 0);
+                if (rc != M2SDR_ERR_OK)
+                    return rc;
+            }
+
+            rc = m2sdr_program_delay_reg(phy, tx, clk, data, j == 0);
+            if (rc != M2SDR_ERR_OK)
+                return rc;
+
+            /* Restart the FPGA PRBS generator so the checker reacquires from a
+             * known seed/phase after each delay change. */
+            if (tx) {
+                rc = m2sdr_write_prbs_tx_ctrl(dev, 0);
+                if (rc != M2SDR_ERR_OK)
+                    return rc;
+                mdelay(1);
+                rc = m2sdr_write_prbs_tx_ctrl(dev, 1u << CSR_AD9361_PRBS_TX_ENABLE_OFFSET);
+                if (rc != M2SDR_ERR_OK)
+                    return rc;
+            }
+
+            mdelay(M2SDR_DELAY_SETTLE_MS);
+
+            rc = m2sdr_read_prbs_synced(dev, &synced);
+            if (rc != M2SDR_ERR_OK)
+                return rc;
+
+            field[edge][j] = synced ? 1u : 0u;
+            if (verbose)
+                printf(" %2u", field[edge][j]);
+        }
+
+        if (verbose)
+            printf("\n");
+    }
+
+    return M2SDR_ERR_OK;
+}
+
+/* Midpoint of the widest valid window across the two edges.
+ *
+ * NOTE: this deliberately differs from the reference no-OS implementation.
+ * ad9361_dig_tune_delay() converts the winning index back into a pure clock
+ * delay (clk = s1 + c1/2, data = 0), which assumes validity depends only on
+ * the RELATIVE delay data - clk, so any pair with the same difference is
+ * interchangeable. That does not hold on this interface: doing it that way
+ * selected (clk 8, data 0) - a pair never actually probed - where the probed
+ * point of equal relative delay, (clk 15, data 7), was fine, and the result
+ * reintroduced the periodic-tone corruption. So return the pair that was
+ * really measured instead of an algebraically equivalent one. */
+static bool m2sdr_pick_edge_midpoint(const unsigned field[2][M2SDR_DELAY_TAPS],
+                                     unsigned *best_clk, unsigned *best_data, unsigned *best_run)
+{
+    unsigned s0 = 0, s1 = 0;
+    unsigned c0 = m2sdr_find_longest_run(field[0], M2SDR_DELAY_TAPS, &s0);
+    unsigned c1 = m2sdr_find_longest_run(field[1], M2SDR_DELAY_TAPS, &s1);
+
+    if (!c0 && !c1)
+        return false;
+
+    if (c1 > c0) {
+        /* edge 1 probed (clk = TAPS-1, data = TAPS-1 - j) */
+        const unsigned j = s1 + c1 / 2;
+
+        if (best_clk)  *best_clk  = M2SDR_DELAY_TAPS - 1;
+        if (best_data) *best_data = M2SDR_DELAY_TAPS - 1 - j;
+        if (best_run)  *best_run  = c1;
+    } else {
+        /* edge 0 probed (clk = 0, data = j) */
+        const unsigned j = s0 + c0 / 2;
+
+        if (best_clk)  *best_clk  = 0;
+        if (best_data) *best_data = j;
+        if (best_run)  *best_run  = c0;
+    }
+    return true;
+}
+
+/* Set M2SDR_DELAY_CAL_FULL=1 to fall back to the exhaustive 16x16 scan (slower,
+ * but prints the full timing matrix - useful when debugging a marginal
+ * interface or validating the edge scan's relative-delay assumption). */
+static bool m2sdr_delay_cal_full_scan(void)
+{
+    const char *s = getenv("M2SDR_DELAY_CAL_FULL");
+
+    return s != NULL && s[0] == '1';
+}
+
+/* Scan + pick for one direction, using the fast edge scan by default. */
+static int m2sdr_tune_direction(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy,
+                                bool tx, unsigned rx_clk_delay, unsigned rx_data_delay,
+                                unsigned *best_clk, unsigned *best_data, unsigned *best_run,
+                                bool verbose)
+{
+    int rc;
+
+    if (m2sdr_delay_cal_full_scan()) {
+        unsigned valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS] = {{0}};
+
+        rc = m2sdr_scan_delay_matrix(dev, phy, tx, rx_clk_delay, rx_data_delay, valid, verbose);
+        if (rc != M2SDR_ERR_OK)
+            return rc;
+        return m2sdr_pick_delay_midpoint(valid, best_clk, best_data, best_run)
+               ? M2SDR_ERR_OK : M2SDR_ERR_IO;
+    } else {
+        unsigned field[2][M2SDR_DELAY_TAPS] = {{0}};
+
+        rc = m2sdr_scan_delay_edges(dev, phy, tx, rx_clk_delay, rx_data_delay, field, verbose);
+        if (rc != M2SDR_ERR_OK)
+            return rc;
+        return m2sdr_pick_edge_midpoint(field, best_clk, best_data, best_run)
+               ? M2SDR_ERR_OK : M2SDR_ERR_IO;
+    }
+}
+
 /* The AD9361 data-port timing shifts with the sample rate, so a delay
  * calibrated at one rate is not necessarily valid at another. The reference
  * no-OS driver re-runs its own digital tune (ad9361_dig_tune()) on every
@@ -966,8 +1148,6 @@ static bool m2sdr_auto_delay_cal_enabled(void)
 static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy,
                                            bool verbose)
 {
-    unsigned rx_valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS] = {{0}};
-    unsigned tx_valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS] = {{0}};
     unsigned best_rx_clk = 0;
     unsigned best_rx_data = 0;
     unsigned best_tx_clk = 0;
@@ -1002,12 +1182,11 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
         goto restore;
     }
 
-    rc = m2sdr_scan_delay_matrix(dev, phy, false, 0, 0, rx_valid, verbose);
-    if (rc != M2SDR_ERR_OK)
-        goto restore;
-    if (!m2sdr_pick_delay_midpoint(rx_valid, &best_rx_clk, &best_rx_data, &best_rx_run)) {
-        fprintf(stderr, "No valid RX Clk/Dat delay settings found.\n");
-        rc = M2SDR_ERR_IO;
+    rc = m2sdr_tune_direction(dev, phy, false, 0, 0,
+                              &best_rx_clk, &best_rx_data, &best_rx_run, verbose);
+    if (rc != M2SDR_ERR_OK) {
+        if (rc == M2SDR_ERR_IO)
+            fprintf(stderr, "No valid RX Clk/Dat delay settings found.\n");
         goto restore;
     }
     rc = m2sdr_program_delay_reg(phy, false, best_rx_clk, best_rx_data, true);
@@ -1030,10 +1209,11 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
         goto restore;
     mdelay(M2SDR_DELAY_SETTLE_MS);
 
-    rc = m2sdr_scan_delay_matrix(dev, phy, true, best_rx_clk, best_rx_data, tx_valid, verbose);
-    if (rc != M2SDR_ERR_OK)
+    rc = m2sdr_tune_direction(dev, phy, true, best_rx_clk, best_rx_data,
+                              &best_tx_clk, &best_tx_data, &best_tx_run, verbose);
+    if (rc != M2SDR_ERR_OK && rc != M2SDR_ERR_IO)
         goto restore;
-    if (!m2sdr_pick_delay_midpoint(tx_valid, &best_tx_clk, &best_tx_data, &best_tx_run)) {
+    if (rc == M2SDR_ERR_IO) {
         fprintf(stderr, "No valid TX Clk/Dat delay settings found, keeping calibrated RX delay and restoring previous TX delay.\n");
         (void)ad9361_spi_write(phy->spi, REG_TX_CLOCK_DATA_DELAY, saved_tx_delay);
         if (verbose) {
