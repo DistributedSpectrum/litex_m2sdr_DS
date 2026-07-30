@@ -833,18 +833,22 @@ static int m2sdr_program_delay_reg(struct ad9361_rf_phy *phy, bool tx, unsigned 
 
 static int m2sdr_scan_delay_matrix(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy,
                                    bool tx, unsigned rx_clk_delay, unsigned rx_data_delay,
-                                   unsigned valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS])
+                                   unsigned valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS],
+                                   bool verbose)
 {
     const char *label = tx ? "TX" : "RX";
     unsigned clk_delay;
     unsigned data_delay;
 
-    printf("\n%s Clk/Dat delays scan...\n", label);
-    printf("-------------------------\n");
-    printf("Clk/Dat |  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15\n");
+    if (verbose) {
+        printf("\n%s Clk/Dat delays scan...\n", label);
+        printf("-------------------------\n");
+        printf("Clk/Dat |  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15\n");
+    }
 
     for (clk_delay = 0; clk_delay < M2SDR_DELAY_TAPS; clk_delay++) {
-        printf(" %2u     |", clk_delay);
+        if (verbose)
+            printf(" %2u     |", clk_delay);
         for (data_delay = 0; data_delay < M2SDR_DELAY_TAPS; data_delay++) {
             bool synced = false;
             int rc;
@@ -882,9 +886,11 @@ static int m2sdr_scan_delay_matrix(struct m2sdr_dev *dev, struct ad9361_rf_phy *
                 return rc;
 
             valid[clk_delay][data_delay] = synced ? 1u : 0u;
-            printf(" %2u", valid[clk_delay][data_delay]);
+            if (verbose)
+                printf(" %2u", valid[clk_delay][data_delay]);
         }
-        printf("\n");
+        if (verbose)
+            printf("\n");
     }
 
     return M2SDR_ERR_OK;
@@ -937,7 +943,28 @@ static bool m2sdr_pick_delay_midpoint(const unsigned valid[M2SDR_DELAY_TAPS][M2S
     return true;
 }
 
-static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy)
+/* The AD9361 data-port timing shifts with the sample rate, so a delay
+ * calibrated at one rate is not necessarily valid at another. The reference
+ * no-OS driver re-runs its own digital tune (ad9361_dig_tune()) on every
+ * clock-chain change for exactly this reason - and bladeRF, on the same RFIC,
+ * gets that behavior. Here that implementation is compiled out
+ * (AXI_ADC_NOT_PRESENT in ad9361/config.h, because the M2SDR uses its own
+ * LiteX register interface rather than ADI's AXI ADC core), so its replacement
+ * - m2sdr_calibrate_interface_delay() - has to be driven from this layer
+ * instead. Without it nothing ever retunes, and any rate whose timing differs
+ * from whatever happened to be calibrated at init yields corrupt or empty
+ * captures.
+ *
+ * Set M2SDR_AUTO_DELAY_CAL=0 to opt out. */
+static bool m2sdr_auto_delay_cal_enabled(void)
+{
+    const char *s = getenv("M2SDR_AUTO_DELAY_CAL");
+
+    return !(s != NULL && s[0] == '0');
+}
+
+static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy,
+                                           bool verbose)
 {
     unsigned rx_valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS] = {{0}};
     unsigned tx_valid[M2SDR_DELAY_TAPS][M2SDR_DELAY_TAPS] = {{0}};
@@ -964,7 +991,8 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
     saved_rx_delay = ad9361_spi_read(phy->spi, REG_RX_CLOCK_DATA_DELAY);
     saved_tx_delay = ad9361_spi_read(phy->spi, REG_TX_CLOCK_DATA_DELAY);
 
-    printf("Calibrating FPGA <-> AD9361 digital interface with PRBS...\n");
+    if (verbose)
+        printf("Calibrating FPGA <-> AD9361 digital interface with PRBS...\n");
 
     rc = m2sdr_write_prbs_tx_ctrl(dev, 0);
     if (rc != M2SDR_ERR_OK)
@@ -974,7 +1002,7 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
         goto restore;
     }
 
-    rc = m2sdr_scan_delay_matrix(dev, phy, false, 0, 0, rx_valid);
+    rc = m2sdr_scan_delay_matrix(dev, phy, false, 0, 0, rx_valid, verbose);
     if (rc != M2SDR_ERR_OK)
         goto restore;
     if (!m2sdr_pick_delay_midpoint(rx_valid, &best_rx_clk, &best_rx_data, &best_rx_run)) {
@@ -985,8 +1013,9 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
     rc = m2sdr_program_delay_reg(phy, false, best_rx_clk, best_rx_data, true);
     if (rc != M2SDR_ERR_OK)
         goto restore;
-    printf("Selected RX Clk Delay: %u, RX Dat Delay: %u (window: %u)\n",
-        best_rx_clk, best_rx_data, best_rx_run);
+    if (verbose)
+        printf("Selected RX Clk Delay: %u, RX Dat Delay: %u (window: %u)\n",
+            best_rx_clk, best_rx_data, best_rx_run);
 
     if (m2sdr_from_ad9361_rc(ad9361_bist_prbs(phy, BIST_DISABLE)) != M2SDR_ERR_OK) {
         rc = M2SDR_ERR_IO;
@@ -1001,28 +1030,33 @@ static int m2sdr_calibrate_interface_delay(struct m2sdr_dev *dev, struct ad9361_
         goto restore;
     mdelay(M2SDR_DELAY_SETTLE_MS);
 
-    rc = m2sdr_scan_delay_matrix(dev, phy, true, best_rx_clk, best_rx_data, tx_valid);
+    rc = m2sdr_scan_delay_matrix(dev, phy, true, best_rx_clk, best_rx_data, tx_valid, verbose);
     if (rc != M2SDR_ERR_OK)
         goto restore;
     if (!m2sdr_pick_delay_midpoint(tx_valid, &best_tx_clk, &best_tx_data, &best_tx_run)) {
         fprintf(stderr, "No valid TX Clk/Dat delay settings found, keeping calibrated RX delay and restoring previous TX delay.\n");
         (void)ad9361_spi_write(phy->spi, REG_TX_CLOCK_DATA_DELAY, saved_tx_delay);
-        printf("\nCalibration completed:\n");
-        printf("----------------------\n");
-        printf("RX Clk:%u/Dat:%u, TX unchanged\n", best_rx_clk, best_rx_data);
+        if (verbose) {
+            printf("\nCalibration completed:\n");
+            printf("----------------------\n");
+            printf("RX Clk:%u/Dat:%u, TX unchanged\n", best_rx_clk, best_rx_data);
+        }
         rc = M2SDR_ERR_OK;
         goto restore;
     }
     rc = m2sdr_program_delay_reg(phy, true, best_tx_clk, best_tx_data, true);
     if (rc != M2SDR_ERR_OK)
         goto restore;
-    printf("Selected TX Clk Delay: %u, TX Dat Delay: %u (window: %u)\n",
-        best_tx_clk, best_tx_data, best_tx_run);
+    if (verbose)
+        printf("Selected TX Clk Delay: %u, TX Dat Delay: %u (window: %u)\n",
+            best_tx_clk, best_tx_data, best_tx_run);
 
-    printf("\nCalibration completed:\n");
-    printf("----------------------\n");
-    printf("RX Clk:%u/Dat:%u, TX Clk:%u/Dat:%u\n",
-        best_rx_clk, best_rx_data, best_tx_clk, best_tx_data);
+    if (verbose) {
+        printf("\nCalibration completed:\n");
+        printf("----------------------\n");
+        printf("RX Clk:%u/Dat:%u, TX Clk:%u/Dat:%u\n",
+            best_rx_clk, best_rx_data, best_tx_clk, best_tx_data);
+    }
 
 restore:
     if (rc != M2SDR_ERR_OK) {
@@ -1567,10 +1601,21 @@ int m2sdr_apply_config(struct m2sdr_dev *dev, const struct m2sdr_config *cfg)
     rc = m2sdr_configure_modes(dev, phy, cfg);
     if (rc != M2SDR_ERR_OK)
         return rc;
+    /* Interface delay calibration. This now runs automatically after the rate
+     * is programmed; --calibrate-delay only selects the verbose scan output
+     * (and makes a calibration failure fatal). See
+     * m2sdr_auto_delay_cal_enabled() for why this must happen on every rate
+     * change and how to opt out. */
     if (cfg->calibrate_interface_delay) {
-        rc = m2sdr_calibrate_interface_delay(dev, phy);
+        rc = m2sdr_calibrate_interface_delay(dev, phy, true);
         if (rc != M2SDR_ERR_OK)
             return rc;
+    } else if (m2sdr_auto_delay_cal_enabled()) {
+        /* Best effort: on failure the previously programmed delays are
+         * restored, so fall back to them rather than failing the whole
+         * configuration. */
+        if (m2sdr_calibrate_interface_delay(dev, phy, false) != M2SDR_ERR_OK)
+            M2SDR_LOGF("Automatic interface delay calibration failed; keeping previous delays.\n");
     }
     rc = m2sdr_run_bist(cfg, dev, phy);
     if (rc != M2SDR_ERR_OK)
@@ -1705,6 +1750,16 @@ int m2sdr_set_sample_rate(struct m2sdr_dev *dev, int64_t rate)
                 return M2SDR_ERR_IO;
             if (m2sdr_from_ad9361_rc(ad9361_set_rx_sampling_freq(phy, actual_rate)) != M2SDR_ERR_OK)
                 return M2SDR_ERR_IO;
+
+            /* The data-port timing is rate dependent, so retune the interface
+             * delay here too - this is the path runtime callers (SoapySDR)
+             * take, and it previously never recalibrated at all. Best effort:
+             * previous delays are restored on failure. Wide-bandwidth mode is
+             * excluded because m2sdr_wide_bandwidth_bringup() re-rolls the
+             * framing phase and verifies alignment itself. */
+            if (m2sdr_auto_delay_cal_enabled() &&
+                m2sdr_calibrate_interface_delay(dev, phy, false) != M2SDR_ERR_OK)
+                M2SDR_LOGF("Automatic interface delay calibration failed; keeping previous delays.\n");
         }
 
         dev->rf_oversample_enabled = wide ? 1 : 0;
