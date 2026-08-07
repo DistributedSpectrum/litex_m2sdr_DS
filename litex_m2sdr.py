@@ -763,7 +763,19 @@ class BaseSoC(SoCMini):
 
         # AD9361 RFIC ------------------------------------------------------------------------------
 
-        with_rfic_stream_fifos = with_eth and not with_pcie
+        # RFIC-domain stream FIFOs.
+        #
+        # Originally enabled only for LiteEth-only designs (UDP burst
+        # tolerance, 7537a10), leaving PCIe on the bare CDC - a
+        # stream.ClockDomainCrossing with no explicit depth, i.e. LiteX's
+        # default AsyncFIFO depth of 4 (32 bytes) between the rfic and sys
+        # clock domains. That leaves the RFIC boundary with essentially no
+        # slack: momentary backpressure from the DMA path discards samples
+        # right where they enter the fabric, invisibly to every overflow
+        # counter. bladeRF, on the same AD9361, buffers this boundary with a
+        # ~32 KB dual-clock FIFO into its fixed-rate transport clock. Enable
+        # the equivalent for PCIe too; cost is BRAM only (~28 extra RAMB36).
+        with_rfic_stream_fifos = True
         self.ad9361 = AD9361RFIC(
             rfic_pads      = platform.request("ad9361_rfic"),
             spi_pads       = platform.request("ad9361_spi"),
