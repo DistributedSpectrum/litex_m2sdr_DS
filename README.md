@@ -419,12 +419,19 @@ For some platforms we created detailed tutorials. For everything else, please fo
 - [Use LiteX-M2SDR on OrangePI 5 Max](doc/hosts/orangepi-5-max.md)
 - [Use LiteX-M2SDR on Raspberry Pi 5](doc/hosts/raspberry-pi-5.md)
 - [Use LiteX-M2SDR on Jetson Orin / NVIDIA L4T](doc/hosts/jetson-orin.md)
+- [Use LiteX-M2SDR on Odroid M1](doc/hosts/odroid-m1.md)
+
+Once the stack is built, [RX and TX Quickstart](doc/rx-tx-quickstart.md) walks through
+receiving, transmitting a tone, streaming an IQ file, and confirming a signal is really
+yours rather than ambient RF.
 
 ### For Software Developers
 
 For those who want to dive deeper into development with the LiteX-M2SDR board, follow these additional steps after completing the SDR enthusiast steps:
 
 For a broader hardware/software debug workflow, see [Debugging Guide](doc/debugging-guide.md).
+For an open investigation into the AD9361 reference clock — why the measured sample rate
+and LO do not match what is requested — see [Clock Investigation](doc/clock-investigation.md).
 
 1. **Test Structure (CI-safe vs hardware scripts):**
    - Gateware simulation/unit tests live in `test/` and are CI-safe (no hardware needed):
