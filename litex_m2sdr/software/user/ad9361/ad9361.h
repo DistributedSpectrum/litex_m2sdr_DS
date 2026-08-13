@@ -3551,6 +3551,8 @@ int32_t ad9361_set_dcxo_tune(struct ad9361_rf_phy *phy,
 			     uint32_t coarse, uint32_t fine);
 int32_t ad9361_tx_mute(struct ad9361_rf_phy *phy, uint32_t state);
 uint32_t ad9361_validate_rf_bw(struct ad9361_rf_phy *phy, uint32_t bw);
+/* [CLKDBG] clock-chain diagnostics, enabled with M2SDR_CLK_DEBUG=1. */
+bool ad9361_clk_debug_enabled(void);
 int32_t ad9361_get_temp(struct ad9361_rf_phy *phy);
 int ad9361_synth_lo_powerdown(struct ad9361_rf_phy *phy,
 			      enum synth_pd_ctrl rx,

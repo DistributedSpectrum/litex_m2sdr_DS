@@ -954,6 +954,18 @@ static int32_t ad9361_spi_writem(struct spi_device *spi,
 #endif
 
 /**
+ * Whether to emit [CLKDBG] clock-chain diagnostics on stderr.
+ * Off unless M2SDR_CLK_DEBUG=1; see doc/clock-investigation.md.
+ * @return true when clock debug output is enabled.
+ */
+bool ad9361_clk_debug_enabled(void)
+{
+	const char *s = getenv("M2SDR_CLK_DEBUG");
+
+	return (s != NULL && s[0] == '1');
+}
+
+/**
  * Validate RF BW frequency.
  * @param phy The AD9361 state structure.
  * @param bw The RF BW frequency.
@@ -4868,6 +4880,30 @@ int32_t ad9361_calculate_rf_clock_chain(struct ad9361_rf_phy *phy,
 	tx_path_clks[T1_FREQ] = tx_path_clks[T2_FREQ] / clk_dividers[index_tx][2];
 	tx_path_clks[CLKTF_FREQ] = tx_path_clks[T1_FREQ] / clk_dividers[index_tx][3];
 	tx_path_clks[TX_SAMPL_FREQ] = tx_path_clks[CLKTF_FREQ] / tx_intdec;
+
+	/* Dump the selected clock chain. Silent unless M2SDR_CLK_DEBUG=1 -- kept
+	 * because the measured sample rate still does not match the requested one
+	 * (see doc/clock-investigation.md) and this is the fastest way to see what
+	 * the driver believes it programmed. */
+	if (ad9361_clk_debug_enabled()) {
+		fprintf(stderr, "[CLKDBG] req=%"PRIu32" gov=%"PRIu32" rx_intdec=%"PRIu32" tx_intdec=%"PRIu32
+			" idx_rx=%"PRId32" idx_tx=%"PRId32"\n",
+			tx_sample_rate, rate_gov, rx_intdec, tx_intdec, index_rx, index_tx);
+		fprintf(stderr, "[CLKDBG]   div_rx=[%d %d %d %d] div_tx=[%d %d %d %d] adc=%"PRIu32" dac=%"PRIu32"\n",
+			clk_dividers[index_rx][0], clk_dividers[index_rx][1],
+			clk_dividers[index_rx][2], clk_dividers[index_rx][3],
+			clk_dividers[index_tx][0], clk_dividers[index_tx][1],
+			clk_dividers[index_tx][2], clk_dividers[index_tx][3],
+			adc_rate, dac_rate);
+		fprintf(stderr, "[CLKDBG]   RX BBPLL=%"PRIu32" ADC=%"PRIu32" R2=%"PRIu32" R1=%"PRIu32
+			" CLKRF=%"PRIu32" SAMPL=%"PRIu32"\n",
+			rx_path_clks[BBPLL_FREQ], rx_path_clks[ADC_FREQ], rx_path_clks[R2_FREQ],
+			rx_path_clks[R1_FREQ], rx_path_clks[CLKRF_FREQ], rx_path_clks[RX_SAMPL_FREQ]);
+		fprintf(stderr, "[CLKDBG]   TX BBPLL=%"PRIu32" DAC=%"PRIu32" T2=%"PRIu32" T1=%"PRIu32
+			" CLKTF=%"PRIu32" SAMPL=%"PRIu32"\n",
+			tx_path_clks[BBPLL_FREQ], tx_path_clks[DAC_FREQ], tx_path_clks[T2_FREQ],
+			tx_path_clks[T1_FREQ], tx_path_clks[CLKTF_FREQ], tx_path_clks[TX_SAMPL_FREQ]);
+	}
 
 	return 0;
 }

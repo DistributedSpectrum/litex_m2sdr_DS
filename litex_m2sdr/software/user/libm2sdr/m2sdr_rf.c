@@ -669,6 +669,30 @@ static int m2sdr_configure_samplerate(struct ad9361_rf_phy *phy,
     if (m2sdr_from_ad9361_rc(ad9361_set_rx_sampling_freq(phy, actual_samplerate)) != M2SDR_ERR_OK)
         return M2SDR_ERR_IO;
 
+    /* What the HARDWARE registers actually report back (clk_get_rate recomputes
+     * from the programmed BBPLL/divider registers), vs what was computed and
+     * requested. Silent unless M2SDR_CLK_DEBUG=1; see doc/clock-investigation.md
+     * -- the measured rate still does not match the requested one, and comparing
+     * these two is how you tell a mis-programmed chain from a bad reference. */
+    if (ad9361_clk_debug_enabled()) {
+        uint32_t rd_rx = 0, rd_tx = 0;
+        uint32_t hw_rx[6] = {0}, hw_tx[6] = {0};
+
+        ad9361_get_rx_sampling_freq(phy, &rd_rx);
+        ad9361_get_tx_sampling_freq(phy, &rd_tx);
+        fprintf(stderr, "[CLKDBG] readback: asked=%u rx_sampl=%u tx_sampl=%u\n",
+                (unsigned)actual_samplerate, (unsigned)rd_rx, (unsigned)rd_tx);
+
+        if (ad9361_get_trx_clock_chain(phy, hw_rx, hw_tx) == 0) {
+            fprintf(stderr, "[CLKDBG] HW RX: BBPLL=%u ADC=%u R2=%u R1=%u CLKRF=%u SAMPL=%u\n",
+                    (unsigned)hw_rx[0], (unsigned)hw_rx[1], (unsigned)hw_rx[2],
+                    (unsigned)hw_rx[3], (unsigned)hw_rx[4], (unsigned)hw_rx[5]);
+            fprintf(stderr, "[CLKDBG] HW TX: BBPLL=%u DAC=%u T2=%u T1=%u CLKTF=%u SAMPL=%u\n",
+                    (unsigned)hw_tx[0], (unsigned)hw_tx[1], (unsigned)hw_tx[2],
+                    (unsigned)hw_tx[3], (unsigned)hw_tx[4], (unsigned)hw_tx[5]);
+        }
+    }
+
     return M2SDR_ERR_OK;
 }
 
