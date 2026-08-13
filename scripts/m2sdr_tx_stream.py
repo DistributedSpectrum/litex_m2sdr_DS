@@ -84,7 +84,12 @@ def build_flowgraph(args):
                     self._keep, tail = (src, cvt, scl), scl
                 else:
                     tail = blocks.file_source(gr.sizeof_gr_complex, args.file, args.repeat)
-                    self._keep = (tail,)
+                    src, self._keep = tail, (tail,)
+                # GNU Radio's default buffer is small enough that at high rates it
+                # drains in well under a millisecond, so any scheduling jitter
+                # starves the sink and shows up as a stream of 'U's. Deepen it.
+                if args.buffer_mb > 0:
+                    src.set_min_output_buffer(int(args.buffer_mb * (1 << 20)))
                 for ch in range(n):
                     self.connect(tail, (self.sink, ch))     # fan the file out to every channel
             else:
@@ -117,6 +122,9 @@ def main():
     parser.add_argument("--secs",      default=20.0, type=float, help="Duration for tone / --repeat mode (s).")
     parser.add_argument("--repeat",    action="store_true", help="Loop the file instead of playing it once.")
     parser.add_argument("--amplitude", default=0.5,  type=float, help="Amplitude, 0..1.")
+    parser.add_argument("--buffer-mb",  default=16.0, type=float,
+                        help="Deepen the GNU Radio source buffer (MiB). Raise this if you see "
+                             "a stream of 'U' underflow markers at high rates; 0 disables.")
     args = parser.parse_args()
 
     if args.make_file:
@@ -135,20 +143,26 @@ def main():
     if args.file:
         print("file %s  %.2f GiB  repeat=%s" % (args.file, tb.nbytes / (1 << 30), args.repeat))
 
-    t0 = time.time()
+    t0, completed = time.time(), False
     tb.start()
-    if args.file and not args.repeat:
-        tb.wait()
-    else:
-        try:
+    try:
+        if args.file and not args.repeat:
+            tb.wait()
+            completed = True
+        else:
             time.sleep(args.secs)
-        except KeyboardInterrupt:
-            pass
+            tb.stop()
+            tb.wait()
+    except KeyboardInterrupt:
+        print("\ninterrupted")
         tb.stop()
         tb.wait()
     dt = time.time() - t0
 
-    if args.file and not args.repeat:
+    if args.file and not args.repeat and not completed:
+        print("stopped after %.2f s before the file finished -- no throughput figure, "
+              "the amount actually streamed is not known." % dt)
+    elif args.file and not args.repeat:
         achieved = tb.nbytes / bps / dt
         print("streamed %.2f GiB in %.2f s" % (tb.nbytes / (1 << 30), dt))
         print("ACHIEVED  disk %.1f MB/s | %.3f MSPS | PCIe %.1f MB/s"
