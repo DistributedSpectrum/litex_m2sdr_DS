@@ -8,8 +8,9 @@
 
 """Sweep the requested sample rate and measure the resulting AD9361 DATA_CLK.
 
-DATA_CLK should come out at 4x the sample rate. Comparing measured against
-expected across a range of rates separates the two failure modes:
+DATA_CLK should come out at 2x the sample rate in 1T1R and 4x in 2T2R (LVDS DDR,
+one edge pair per channel). Comparing measured against expected across a range of
+rates separates the two failure modes:
 
   - a ratio that stays CONSTANT across rates  -> a pure reference-frequency
     scale error; the divider chain is being selected correctly
@@ -92,9 +93,10 @@ def main():
     # it is not what we are measuring here.
     env = dict(os.environ, M2SDR_AUTO_DELAY_CAL="0")
 
-    print("layout %s, LO %.3f MHz -- DATA_CLK should be 4x the sample rate"
-          % (args.layout, args.freq / 1e6))
-    print("%12s %14s %12s %10s" % ("requested", "DATA_CLK MHz", "DATA_CLK/Fs", "vs 4xFs"))
+    expect = 2 if args.layout == "1t1r" else 4
+    print("layout %s, LO %.3f MHz -- DATA_CLK should be %dx the sample rate"
+          % (args.layout, args.freq / 1e6, expect))
+    print("%12s %14s %12s %10s" % ("requested", "DATA_CLK MHz", "DATA_CLK/Fs", "vs %dxFs" % expect))
     ratios = []
     for rate in rates:
         subprocess.run([rf, "--sample-rate=%d" % int(rate), "--channel-layout=%s" % args.layout,
@@ -107,8 +109,8 @@ def main():
         if clk != clk:                       # NaN
             print("%11.3fM %14s" % (fs, "measure failed"))
             continue
-        ratios.append(clk / (4 * fs))
-        print("%11.3fM %14.3f %12.4f %10.4f" % (fs, clk, clk / fs, clk / (4 * fs)))
+        ratios.append(clk / (expect * fs))
+        print("%11.3fM %14.3f %12.4f %10.4f" % (fs, clk, clk / fs, clk / (expect * fs)))
 
     if ratios and max(ratios) == 0.0:
         print("\nEvery measurement read 0 MHz. DATA_CLK is only present once the RFIC is"
@@ -116,7 +118,8 @@ def main():
               "\nm2sdr_rf actually applied the rate.")
     elif len(ratios) >= 2:
         spread = max(ratios) - min(ratios)
-        print("\nratio vs 4xFs: min %.4f max %.4f spread %.4f" % (min(ratios), max(ratios), spread))
+        print("\nratio vs %dxFs: min %.4f max %.4f spread %.4f"
+              % (expect, min(ratios), max(ratios), spread))
         if spread < 0.01:
             print("=> CONSTANT across rates: divider selection is consistent; a ratio far from "
                   "1.0 points at the reference frequency, not the chain.")
