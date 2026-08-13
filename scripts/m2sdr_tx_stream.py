@@ -159,7 +159,10 @@ def main():
     parser.add_argument("--bandwidth", default=20e6, type=float, help="TX filter bandwidth (Hz).")
     parser.add_argument("--att",       default=50.0, type=float,
                         help="TX ATTENUATION in dB, 0..89. Attenuation, not gain: 0 is FULL POWER.")
-    parser.add_argument("--secs",      default=20.0, type=float, help="Duration for tone / --repeat mode (s).")
+    parser.add_argument("--secs",      default=20.0, type=float,
+                        help="How long to transmit in tone or --repeat mode. NOTE this bounds\n"
+                             "--repeat: the file loops, but the run still stops after --secs.\n"
+                             "Use 0 to transmit until Ctrl-C. Ignored when playing a file once.")
     parser.add_argument("--repeat",    action="store_true", help="Loop the file instead of playing it once.")
     parser.add_argument("--amplitude", default=0.5,  type=float, help="Amplitude, 0..1.")
     parser.add_argument("--buffer-mb",  default=16.0, type=float,
@@ -228,6 +231,11 @@ def main():
             tb.wait()
             completed = True
         else:
+            # --secs 0 means run until Ctrl-C, matching m2sdr_tx_tone.py.
+            if args.secs == 0:
+                print("transmitting until Ctrl-C ...")
+                while True:
+                    time.sleep(0.5)
             time.sleep(args.secs)
             tb.stop()
             tb.wait()
