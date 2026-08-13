@@ -14,10 +14,20 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "config.h"
 #include "csr.h"
 #include "m2sdr_internal.h"
+
+/* [BYPASSDBG] streaming diagnostics, enabled with M2SDR_STREAM_DEBUG=1.
+ * Off by default: these fire on every stream activation. */
+static bool m2sdr_stream_debug_enabled(void)
+{
+    const char *s = getenv("M2SDR_STREAM_DEBUG");
+
+    return (s != NULL && s[0] == '1');
+}
 
 #include "litepcie_helpers.h"
 
@@ -863,10 +873,15 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
     if (dev->transport == M2SDR_TRANSPORT_LITEPCIE) {
         uint32_t bypass_val = 0xdeadbeef;
         int rc = m2sdr_reg_read(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, &bypass_val);
-        fprintf(stderr, "[BYPASSDBG] at stream_activate(dir=%d): bypass_reg=0x%x (rc=%d), zero_copy=%d, rx_configured=%d\n",
-                direction, bypass_val, rc, dev->zero_copy, dev->rx_configured);
+        if (m2sdr_stream_debug_enabled())
+            fprintf(stderr, "[BYPASSDBG] at stream_activate(dir=%d): bypass_reg=0x%x (rc=%d), zero_copy=%d, rx_configured=%d\n",
+                    direction, bypass_val, rc, dev->zero_copy, dev->rx_configured);
+        /* Re-assertion below is functional, not diagnostic: the header FSMs stay
+         * in gateware reset until the synchronizer reports synced, so without the
+         * bypass real streaming waits forever. Only the logging is optional. */
         if (bypass_val != 1) {
-            fprintf(stderr, "[BYPASSDBG] re-asserting bypass=1\n");
+            if (m2sdr_stream_debug_enabled())
+                fprintf(stderr, "[BYPASSDBG] re-asserting bypass=1\n");
             m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
         }
     }
