@@ -65,7 +65,7 @@ def test_build_phc2sys_command_uses_host_as_source(tmp_path):
         str(phc2sys),
         "-s", "CLOCK_REALTIME",
         "-c", "/dev/ptp4",
-        "-O", "0.0",
+        "-O", "0",
         "-R", "4.0",
     ]
     assert "-N" in cmd

@@ -246,38 +246,78 @@ class AD9361RXBitMode(LiteXModule):
             for i in range(4)
         ]
         beat_max = _max4(self, sample_abs)
-        next_max_abs = Signal(13)
-        self.comb += next_max_abs.eq(Mux(bfp8_max_abs > beat_max, bfp8_max_abs, beat_max))
+
+        # Block-max pipeline.
+        # -------------------
+        # The 4-way max tree, the accumulate comparison and the accumulator's
+        # clock enable all used to sit in a single combinational path: it ran
+        # from the mode CSR, through four 13-bit absolute values, a three-deep
+        # comparator tree and one more 13-bit compare, into
+        # bfp8_max_abs's CE. That is 15 logic levels including seven chained
+        # CARRY4s, and at 125 MHz it closed at -0.355 ns with 33 failing
+        # endpoints.
+        #
+        # Split it across two cycles instead. Stage 1 registers the per-beat
+        # max, so the max tree terminates at a flop. Stage 2 accumulates from
+        # that registered value, and its clock enable is now a plain register
+        # output rather than mode-CSR and downstream-ready logic.
+        #
+        # Cost is one cycle per block, absorbed by BFP8_MAXFOLD below, which
+        # lets the final beat fold in before the exponent is decoded.
+        bfp8_collecting = Signal()
+        bfp8_clear_max  = Signal()
+        beat_max_r      = Signal(13)
+        beat_max_valid  = Signal()
+
+        self.sync += [
+            beat_max_r.eq(beat_max),
+            beat_max_valid.eq(bfp8_collecting & sink.valid & sink.ready),
+            If(bfp8_clear_max,
+                bfp8_max_abs.eq(0),
+            ).Elif(beat_max_valid,
+                bfp8_max_abs.eq(Mux(bfp8_max_abs > beat_max_r, bfp8_max_abs, beat_max_r)),
+            ),
+        ]
 
         self.bfp8_fsm = bfp8_fsm = FSM(reset_state="BFP8_COLLECT")
         bfp8_fsm.act("BFP8_COLLECT",
             If(mode != _BFP8_MODE,
                 NextValue(bfp8_collect_count, 0),
-                NextValue(bfp8_max_abs, 0),
+                bfp8_clear_max.eq(1),
             ).Else(
+                bfp8_collecting.eq(1),
                 sink.ready.eq(bfp8_fifo.sink.ready),
                 bfp8_fifo.sink.valid.eq(sink.valid),
                 bfp8_fifo.sink.data.eq(sink.data),
-                NextValue(bfp8_max_abs,
-                    Mux(sink.valid & sink.ready, next_max_abs, bfp8_max_abs)),
                 If(sink.valid & sink.ready,
                     If(bfp8_collect_count == (bfp8_input_words - 1),
                         NextValue(bfp8_collect_count, 0),
-                        NextState("BFP8_EXPONENT"),
+                        NextState("BFP8_MAXFOLD"),
                     ).Else(
                         NextValue(bfp8_collect_count, bfp8_collect_count + 1),
                     )
                 )
             )
         )
+        bfp8_fsm.act("BFP8_MAXFOLD",
+            # The last beat's max was registered on the cycle we left
+            # BFP8_COLLECT; give it this cycle to fold into bfp8_max_abs so the
+            # exponent below is decoded from the settled block max.
+            If(mode != _BFP8_MODE,
+                bfp8_clear_max.eq(1),
+                NextState("BFP8_COLLECT"),
+            ).Else(
+                NextState("BFP8_EXPONENT"),
+            )
+        )
         bfp8_fsm.act("BFP8_EXPONENT",
             If(mode != _BFP8_MODE,
-                NextValue(bfp8_max_abs, 0),
+                bfp8_clear_max.eq(1),
                 NextState("BFP8_COLLECT"),
             ).Else(
                 # Keep the block max and exponent decode out of the same cycle.
                 NextValue(bfp8_exponent, _bfp8_exponent(bfp8_max_abs)),
-                NextValue(bfp8_max_abs, 0),
+                bfp8_clear_max.eq(1),
                 NextState("BFP8_HEADER"),
             )
         )
