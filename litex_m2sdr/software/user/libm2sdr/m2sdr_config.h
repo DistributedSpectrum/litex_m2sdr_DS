@@ -494,7 +494,15 @@ M2SDR_CONFIG_DEF M2SDR_CONFIG_UNUSED AD9361_InitParam default_init_param = {
     10000,  //tx_attenuation_mdB *** adi,tx-attenuation-mdB
     0,      //update_tx_gain_in_alert_enable *** adi,update-tx-gain-in-alert-enable
     /* Reference Clock Control */
-    0,      //xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable
+    /* 1 = the AD9361 is fed a driven clock on XTALN, so bypass its internal
+     * crystal-oscillator amplifier (sets XO_BYPASS, bit 4 of REG_CLOCK_ENABLE
+     * 0x009). The board drives this pin, so running the XO amp against it is
+     * wrong. bladeRF sets the same parameter to 1 for the same reason --
+     * see bladeRF fpga_common/src/ad936x_params.c ("Expect external clock
+     * into XTALN"); with it at 0 our AD9361 registers were otherwise
+     * byte-identical to a working bladeRF. Verify on hardware with:
+     *   m2sdr_util ad9361-read 0x009   ->  expect 0x0017 (0x0007 means unset) */
+    1,      //xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable
     {8, 5920},  //dcxo_coarse_and_fine_tune[2] *** adi,dcxo-coarse-and-fine-tune
     CLKOUT_DISABLE, //clk_output_mode_select *** adi,clk-output-mode-select
     /* Gain Control */
