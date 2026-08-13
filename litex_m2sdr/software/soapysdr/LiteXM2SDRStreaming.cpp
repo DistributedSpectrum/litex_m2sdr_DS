@@ -1670,7 +1670,17 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
     }
 }
 
-/* Interleave CF32 samples. */
+/* Interleave CF32 samples.
+ *
+ * `offset` indexes the SOURCE buffer only (appendTxSamples() passes
+ * userOffset + appended). It must NOT be applied to `dst`: the caller has
+ * already positioned the destination via remainderOffset + the channel slot,
+ * and ensureTxRemainderBuffer() zeroes remainderOffset for each fresh DMA
+ * buffer. Adding it here too double-counted the position and ran off the end
+ * of the buffer on any write that spanned a buffer boundary -- which is why
+ * TX from GNU Radio (partial writes) segfaulted in 1T1R while the raw
+ * SoapySDR API (full MTU-sized writes, offset always 0) survived.
+ */
 void SoapyLiteXM2SDR::interleaveCF32(
     const void *src,
     void *dst,
@@ -1679,7 +1689,7 @@ void SoapyLiteXM2SDR::interleaveCF32(
     const float *samples_cf32 = reinterpret_cast<const float*>(src) + (offset * _samplesPerComplex);
 
     if (_bytesPerSample == 2) {
-        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst);
         for (uint32_t i = 0; i < len; i++) {
             dst_int16[0] = static_cast<int16_t>(samples_cf32[0] * _samplesScaling); /* I. */
             dst_int16[1] = static_cast<int16_t>(samples_cf32[1] * _samplesScaling); /* Q. */
@@ -1687,7 +1697,7 @@ void SoapyLiteXM2SDR::interleaveCF32(
             dst_int16 += _nChannels * _samplesPerComplex;
         }
     } else if (_bytesPerSample == 1) {
-        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst);
         for (uint32_t i = 0; i < len; i++) {
             dst_int8[0] = cf32_to_sc8(samples_cf32[0], _samplesScaling); /* I. */
             dst_int8[1] = cf32_to_sc8(samples_cf32[1], _samplesScaling); /* Q. */
@@ -1735,7 +1745,8 @@ void SoapyLiteXM2SDR::deinterleaveCF32(
     }
 }
 
-/* Interleave CS16 samples */
+/* Interleave CS16 samples. `offset` indexes the SOURCE buffer only --
+ * see the note on interleaveCF32() for why it must not be applied to `dst`. */
 void SoapyLiteXM2SDR::interleaveCS16(
     const void *src,
     void *dst,
@@ -1744,7 +1755,7 @@ void SoapyLiteXM2SDR::interleaveCS16(
     const int16_t *samples_cs16 = reinterpret_cast<const int16_t*>(src) + (offset * _samplesPerComplex);
 
     if (_bytesPerSample == 2) {
-        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst);
 
         for (uint32_t i = 0; i < len; i++) {
             dst_int16[0] = samples_cs16[0]; /* I. */
@@ -1753,7 +1764,7 @@ void SoapyLiteXM2SDR::interleaveCS16(
             dst_int16 += _nChannels * _samplesPerComplex;
         }
     } else if (_bytesPerSample == 1) {
-        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst);
 
         for (uint32_t i = 0; i < len; i++) {
             dst_int8[0] = sc16_q11_to_sc8(samples_cs16[0]); /* I. */
@@ -1798,7 +1809,8 @@ void SoapyLiteXM2SDR::deinterleaveCS16(
     }
 }
 
-/* Interleave CS8 samples */
+/* Interleave CS8 samples. `offset` indexes the SOURCE buffer only --
+ * see the note on interleaveCF32() for why it must not be applied to `dst`. */
 void SoapyLiteXM2SDR::interleaveCS8(
     const void *src,
     void *dst,
@@ -1807,7 +1819,7 @@ void SoapyLiteXM2SDR::interleaveCS8(
     const int8_t *samples_cs8 = reinterpret_cast<const int8_t*>(src) + (offset * _samplesPerComplex);
 
     if (_bytesPerSample == 1) {
-        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int8_t *dst_int8 = reinterpret_cast<int8_t*>(dst);
         for (uint32_t i = 0; i < len; i++) {
             dst_int8[0] = samples_cs8[0]; /* I. */
             dst_int8[1] = samples_cs8[1]; /* Q. */
@@ -1815,7 +1827,7 @@ void SoapyLiteXM2SDR::interleaveCS8(
             dst_int8 += _nChannels * _samplesPerComplex;
         }
     } else if (_bytesPerSample == 2) {
-        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst) + (offset * 2 * _samplesPerComplex);
+        int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst);
         for (uint32_t i = 0; i < len; i++) {
             dst_int16[0] = static_cast<int16_t>(samples_cs8[0]) << 4; /* I. */
             dst_int16[1] = static_cast<int16_t>(samples_cs8[1]) << 4; /* Q. */
