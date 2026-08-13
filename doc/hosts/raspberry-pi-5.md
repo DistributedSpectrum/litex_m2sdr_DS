@@ -209,6 +209,73 @@ On a Pi 5, the PCIe host bridge has no `dma-coherent` devicetree property (check
 
 With all three fixes applied, `m2sdr_util --duration 10 --zero-copy dma-test` sustains ~2.9-3.6 Gbps with 0 errors across 460,000+ buffers on a Pi 5.
 
+### Dual M.2 HAT: the SDR and an NVMe share one PCIe uplink
+
+With a two-slot HAT (tested: Seeed dual M.2) both devices sit behind an ASMedia ASM2806 switch whose upstream to the Pi is a single x1 link. The kernel says so at boot:
+
+```
+pci 0001:01:00.0: 7.876 Gb/s available PCIe bandwidth, limited by 8.0 GT/s PCIe x1 link at 0001:00:00.0
+```
+
+That is roughly **984 MB/s shared between the NVMe and the SDR**, in both directions combined. Streaming an IQ file from the NVMe to TX therefore spends the budget twice — once reading, once writing. At 30.72 MSPS 2T2R that is ~216 MB/s of PCIe plus ~108 MB/s of disk and fits comfortably; 61.44 MSPS 2T2R (~492 + ~246 MB/s) still fits; 122.88 MSPS 2T2R does not.
+
+Config used, in the `[all]` section of `/boot/firmware/config.txt`:
+
+```
+kernel=kernel8.img                  # REQUIRED: driver hardcodes DMA_BUFFER_SIZE=8192, needs 4K pages
+dtparam=pciex1
+dtparam=pciex1_gen=3
+dtoverlay=pcie-32bit-dma-pi5
+dtoverlay=pciex1-compat-pi5,l1ss=off,no-l0s=on,no-mip,mmio-hi
+dtoverlay=pcie-fix
+```
+
+plus `pci=pcie_bus_safe pci=noaer pcie_aspm=off pcie_port_pm=off` appended to `cmdline.txt`. `pcie-fix.dtbo` is not in Raspberry Pi OS; fetch it from the HAT vendor and drop it in `/boot/firmware/overlays/`.
+
+Note `pciex1_gen=3` is what the HAT vendor specifies but is not a certified Pi 5 configuration. If the link becomes unreliable, `pciex1_gen=2` is the first thing to try.
+
+### The whole HAT can latch off the bus, and only a power cycle clears it
+
+Twice during bring-up the entire PCIe domain disappeared — SDR and NVMe both — with:
+
+```
+brcm-pcie 1000110000.pcie: link down
+```
+
+**Warm reboots do not recover this.** Power must actually be removed. A related but distinct failure is the SDR alone going missing while the switch is fine; there the downstream port reports `PresDet-` and `EqualizationComplete-`, which means the FPGA never finished configuring and so never presented receiver termination. That one usually is recoverable with a warm reboot, and is worth checking against the gateware build string afterwards — if it comes back reporting an older build, multiboot fell back to the golden image at flash offset 0 because the operational image at `0x800000` failed to load.
+
+### Two apt traps when installing the toolchain
+
+`raspberrypi-kernel-headers` does not exist on Debian 13 (trixie). apt aborts the entire transaction on an unknown package, so including it installs **nothing at all** while looking like a routine failure. The correct package is `linux-headers-rpi-v8`.
+
+That package in turn **pulls in a newer kernel**. After the next reboot `uname -r` changes, and a module built before it is left in the wrong `/lib/modules/<version>/` directory. The symptom is confusing: the PCIe device enumerates normally, `lspci` shows it, and there is simply no `/dev/m2sdr0`. Rebuild the driver after rebooting onto the final kernel.
+
+`scripts/m2sdr_provision_host.sh` handles all of this, including `--driver-only` for the post-reboot rebuild.
+
+### Mounting an NVMe for capture storage — use `nofail`
+
+```
+UUID=<uuid>  /data  ext4  defaults,nofail,x-systemd.device-timeout=10  0  2
+```
+
+`nofail` is not optional on this hardware. Given the HAT can drop off the bus entirely (above), a plain fstab entry leaves the Pi hanging at boot waiting for a device that is not on the bus. Use the UUID rather than `/dev/nvme0n1p1` so enumeration order cannot matter.
+
+### Cloning gateware between two boards
+
+To get two cards onto a byte-identical image, copy the flash rather than rebuilding — the operational image lives at `0x800000`:
+
+```bash
+# on the known-good board
+m2sdr_util flash-read /tmp/op.bin 4194304 0x800000
+# trim the trailing 0xFF erase pad, then on the target board
+m2sdr_util -y flash-write op_clone.bin 0x800000
+sudo reboot
+```
+
+Sanity-check the read before writing it anywhere: a Xilinx bitstream has the sync word `AA995566` within the first ~64 bytes. Confirm afterwards with `m2sdr_util info`, which reports the build timestamp.
+
+Identify boards by **FPGA DNA** (`m2sdr_util info`), not by which host they are plugged into — cards get swapped between chassis and the DNA is the only thing that follows the card.
+
 ## Buildroot
 
 *TBD*
