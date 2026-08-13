@@ -123,7 +123,9 @@ def build_phc2sys_command(args, phc):
         resolve_phc2sys(args.phc2sys),
         "-s", args.source,
         "-c", str(phc),
-        "-O", str(args.offset),
+        # phc2sys -O takes an INTEGER number of seconds; passing "0.0" is
+        # rejected with "-O: 0.0 is a malformed value" and nothing syncs.
+        "-O", str(int(args.offset)),
         "-R", str(args.rate),
         "-N", str(args.readings),
     ]
@@ -186,7 +188,7 @@ def add_args(parser):
         "--offset",
         default=0.0,
         type=float,
-        help="sink-source offset in seconds.",
+        help="sink-source offset in whole seconds (phc2sys -O takes an integer).",
     )
     parser.add_argument(
         "--rate",
