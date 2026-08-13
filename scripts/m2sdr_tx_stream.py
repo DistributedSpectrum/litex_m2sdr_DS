@@ -22,6 +22,7 @@ fed from the same drive is close to the ceiling.
 
 import os
 import sys
+import json
 import time
 import argparse
 
@@ -52,6 +53,41 @@ def make_file(path, size_gb, fmt, rate, tone, amplitude):
         os.fsync(f.fileno())
     dt = time.time() - t0
     print("  wrote %.2f GiB in %.1f s = %.0f MB/s" % (written / (1 << 30), dt, written / dt / 1e6))
+
+
+# SigMF ---------------------------------------------------------------------------------------------
+
+# SigMF core:datatype -> our --format. Only the complex types the SDR can send.
+SIGMF_DATATYPES = {
+    "cf32_le": "cf32", "cf32": "cf32",
+    "ci16_le": "cs16", "ci16": "cs16",
+}
+
+def read_sigmf(path):
+    """Return the .sigmf-meta global block for a data file, or None.
+
+    SigMF pairs <base>.sigmf-data with <base>.sigmf-meta. Reading it removes a
+    whole class of mistake: passing --format cs16 for a cf32 recording produces
+    a plausible-looking but completely wrong signal rather than an error.
+    """
+    meta = path[:-len(".sigmf-data")] + ".sigmf-meta" if path.endswith(".sigmf-data") else path + ".sigmf-meta"
+    if not os.path.exists(meta):
+        return None
+    try:
+        with open(meta) as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        print("warning: could not read %s (%s)" % (meta, e))
+        return None
+    g = doc.get("global", {})
+    caps = doc.get("captures") or [{}]
+    return {
+        "path":      meta,
+        "datatype":  g.get("core:datatype"),
+        "rate":      g.get("core:sample_rate"),
+        "freq":      caps[0].get("core:frequency"),
+        "desc":      g.get("core:description"),
+    }
 
 # Flowgraph ----------------------------------------------------------------------------------------
 
@@ -111,11 +147,15 @@ def main():
     parser.add_argument("--file",                            help="IQ file to stream. Omit for an internal tone.")
     parser.add_argument("--make-file",                       help="Generate a test IQ file at this path and exit.")
     parser.add_argument("--size-gb",   default=4.0,  type=float, help="Size for --make-file (GiB).")
-    parser.add_argument("--format",    default="cs16", choices=["cs16", "cf32"], help="IQ file sample format.")
+    parser.add_argument("--format",    default=None, choices=["cs16", "cf32"],
+                        help="IQ file sample format. Default: from a SigMF .sigmf-meta sidecar "
+                             "when present, otherwise cs16.")
     parser.add_argument("--channels",  default=1,    type=int, choices=[1, 2], help="1 = 1T1R, 2 = 2T2R.")
     parser.add_argument("--freq",      default=1e9,  type=float, help="TX LO frequency (Hz).")
     parser.add_argument("--tone",      default=1e6,  type=float, help="Tone offset (Hz) when not streaming a file.")
-    parser.add_argument("--rate",      default=30.72e6, type=float, help="Sample rate (SPS).")
+    parser.add_argument("--rate",      default=None, type=float,
+                        help="Sample rate (SPS). Default: from the SigMF sidecar when present, "
+                             "otherwise 30.72e6.")
     parser.add_argument("--bandwidth", default=20e6, type=float, help="TX filter bandwidth (Hz).")
     parser.add_argument("--att",       default=50.0, type=float,
                         help="TX ATTENUATION in dB, 0..89. Attenuation, not gain: 0 is FULL POWER.")
@@ -126,6 +166,44 @@ def main():
                         help="Deepen the GNU Radio source buffer (MiB). Raise this if you see "
                              "a stream of 'U' underflow markers at high rates; 0 disables.")
     args = parser.parse_args()
+
+    # Resolve --format / --rate: an explicit flag wins, then a SigMF sidecar,
+    # then the historical defaults.
+    meta = read_sigmf(args.file) if args.file else None
+    if meta:
+        print("SigMF sidecar: %s" % meta["path"])
+        if meta["desc"]:
+            print("  description : %s" % meta["desc"])
+        if meta["datatype"]:
+            mapped = SIGMF_DATATYPES.get(meta["datatype"])
+            if mapped is None:
+                sys.exit("SigMF core:datatype %r is not a complex type this tool can transmit "
+                         "(known: %s)" % (meta["datatype"], ", ".join(sorted(SIGMF_DATATYPES))))
+            note = "" if args.format is None else "   (overridden by --format %s)" % args.format
+            print("  datatype    : %s -> %s%s" % (meta["datatype"], mapped, note))
+            if args.format is None:
+                args.format = mapped
+        if meta["rate"]:
+            note = "" if args.rate is None else "   (overridden by --rate)"
+            print("  sample_rate : %.6f MSPS%s" % (meta["rate"] / 1e6, note))
+            if args.rate is None:
+                args.rate = float(meta["rate"])
+        if meta["freq"] is not None:
+            print("  recorded at : %.6f MHz" % (meta["freq"] / 1e6))
+            if abs(meta["freq"] - args.freq) > 1e3:
+                print("  NOTE: transmitting at %.6f MHz, %.3f MHz from where this was recorded."
+                      % (args.freq / 1e6, (args.freq - meta["freq"]) / 1e6))
+    elif args.file and args.file.endswith(".sigmf-data") and (args.format is None or args.rate is None):
+        # A SigMF recording whose sidecar did not come along. Falling back to the
+        # generic defaults here is dangerous: sending a cf32 recording through the
+        # cs16 path produces a plausible-looking but completely wrong signal.
+        print("WARNING: %s has no .sigmf-meta sidecar next to it." % args.file)
+        print("         Falling back to --format cs16 --rate 30.72e6, which is very likely")
+        print("         wrong for this file. Copy the sidecar, or pass --format/--rate.")
+    if args.format is None:
+        args.format = "cs16"
+    if args.rate is None:
+        args.rate = 30.72e6
 
     if args.make_file:
         make_file(args.make_file, args.size_gb, args.format, args.rate, args.tone, args.amplitude)
