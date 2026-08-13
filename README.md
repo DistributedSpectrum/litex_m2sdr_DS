@@ -425,6 +425,9 @@ Once the stack is built, [RX and TX Quickstart](doc/rx-tx-quickstart.md) walks t
 receiving, transmitting a tone, streaming an IQ file, and confirming a signal is really
 yours rather than ambient RF.
 
+For a verified gateware + host + SDR-stack combination to fall back to, see
+[Known-Good Configuration](doc/known-good-configuration.md).
+
 ### For Software Developers
 
 For those who want to dive deeper into development with the LiteX-M2SDR board, follow these additional steps after completing the SDR enthusiast steps:
