@@ -118,9 +118,31 @@ class AD9361PRBS1R1TChecker(LiteXModule):
         state   = Signal(16, reset=seed)
         state_n = Signal(16)
 
+        # Input pipeline.
+        # ia/ib arrive straight from the PHY's sync FIFO, whose distributed-RAM
+        # output register the placer cannot move. From there the path runs
+        # through the 12-bit compares and into state's synchronous reset in a
+        # single rfic_clk cycle (4.069ns at 245.76MHz), and it closed negative
+        # with two thirds of the delay in routing alone.
+        #
+        # Re-registering ia/ib/ce here gives the placer flops it is free to put
+        # next to the comparator. Delaying all three together shifts the whole
+        # checker by one cycle, so the reference still advances once per word
+        # and stays in lockstep with the data.
+        ce_d = Signal()
+        ia_d = Signal(12)
+        ib_d = Signal(12)
+        self.sync += [
+            ce_d.eq(self.ce),
+            If(self.ce,
+                ia_d.eq(self.ia),
+                ib_d.eq(self.ib),
+            ),
+        ]
+
         # PRBS reference (advance by 2 per word, reseed on error).
         self.comb += state_n.eq(_prbs16_next(state))
-        self.sync += If(self.ce,
+        self.sync += If(ce_d,
             If(error,
                 state.eq(seed)
             ).Else(
@@ -129,8 +151,8 @@ class AD9361PRBS1R1TChecker(LiteXModule):
         )
 
         # Error generation.
-        self.comb += If(self.ce,
-            error.eq((self.ia != state[:12]) | (self.ib != state_n[:12]))
+        self.comb += If(ce_d,
+            error.eq((ia_d != state[:12]) | (ib_d != state_n[:12]))
         )
 
         # Sync generation.

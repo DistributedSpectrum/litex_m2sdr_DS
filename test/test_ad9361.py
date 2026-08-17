@@ -17,6 +17,7 @@ from litex_m2sdr.gateware.ad9361.bitmode import (
     BFP8_HEADER_MAGIC,
 )
 from litex_m2sdr.gateware.ad9361.prbs import AD9361PRBSChecker, AD9361PRBSGenerator
+from litex_m2sdr.gateware.ad9361.prbs import AD9361PRBS1R1TChecker, AD9361PRBS1R1TGenerator
 
 # AD9361 BitMode Tests ----------------------------------------------------------------------------
 
@@ -427,3 +428,78 @@ def test_ad9361_prbs_checker_stays_unsynced_after_error_burst():
     assert any(synced[1100:1200])  # initially locked
     assert synced[1210] == 0        # lost lock after error burst
     assert not any(synced[-200:])   # remains out-of-lock with free-running source
+
+
+def test_ad9361_prbs_1r1t_checker_sync_and_loss():
+    """Verify the interleaved 1R1T checker syncs on a matching pair stream and drops sync."""
+    gen = AD9361PRBS1R1TGenerator(seed=0x0A54)
+    chk = AD9361PRBS1R1TChecker(seed=0x0A54)
+    dut = Module()
+    dut.submodules += gen, chk
+    synced = []
+
+    def stimulus():
+        for _ in range(1200):
+            yield chk.ia.eq((yield gen.o)      & 0xFFF)
+            yield chk.ib.eq((yield gen.o_next) & 0xFFF)
+            synced.append((yield chk.synced))
+            yield
+        # Inject wrong samples to force loss of sync.
+        for _ in range(8):
+            yield chk.ia.eq(0x000)
+            yield chk.ib.eq(0x000)
+            synced.append((yield chk.synced))
+            yield
+
+    run_simulation(dut, stimulus())
+    assert any(synced[1100:1200])  # locks onto the interleaved pair stream
+    assert synced[-1] == 0         # drops sync on injected errors
+
+
+def _prbs16_next_py(state):
+    """Software mirror of the gateware LFSR step, for driving the checker directly."""
+    fb = 0
+    for tap in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+        fb ^= (state >> tap) & 1
+    return ((state << 1) & 0xFFFF) | fb
+
+
+def test_ad9361_prbs_1r1t_checker_ce_hold():
+    """Verify the 1R1T checker holds its reference while clock-enable is deasserted.
+
+    The checker registers ia/ib/ce on the way in, so a ce gap must stall the
+    reference rather than advance it against data that never arrived; otherwise
+    the reference and the stream lose lockstep and sync never recovers.
+
+    The stream is precomputed and advanced only on accepted words, so the stall
+    boundary carries no testbench skew of its own.
+    """
+    chk = AD9361PRBS1R1TChecker(seed=0x0A54)
+    synced = []
+
+    def stimulus():
+        state = 0x0A54
+
+        def present(word_state):
+            state_n = _prbs16_next_py(word_state)
+            yield chk.ia.eq(word_state & 0xFFF)
+            yield chk.ib.eq(state_n    & 0xFFF)
+            return _prbs16_next_py(state_n)
+
+        # Lock first.
+        for _ in range(1200):
+            state = yield from present(state)
+            yield
+        # Stall: ce low, no new word presented, reference must hold.
+        yield chk.ce.eq(0)
+        for _ in range(16):
+            yield
+        yield chk.ce.eq(1)
+        # Resume from exactly where the stream left off.
+        for _ in range(600):
+            state = yield from present(state)
+            synced.append((yield chk.synced))
+            yield
+
+    run_simulation(chk, stimulus())
+    assert all(synced[-200:])  # stays locked across the ce gap
