@@ -6,7 +6,42 @@ Hardware: two LiteX-M2SDR M.2 cards (FPGA DNA `0x0024c4825710485c`,
 micro (same AD9361 RFIC, same nominal 38.4 MHz reference) plus a bench spectrum
 analyzer.
 
-## Conclusion, corrected
+## Resolution (2026-10-20): a LiteX code-generation bug, not the clock
+
+The SI5351 was never being programmed on our builds. LiteX `5b641f517`
+(2026-06-16, "gen/fhdl: unify combinatorial Verilog generation") made generated
+`always @(*)` blocks use blocking `=` assignments while keeping source statement
+order. LiteI2C's PHY reads `sr_out_en` (in `If(sr_out_en, sda_oe.eq(1), ...)`)
+before the FSM statement that assigns it, in the same block, so in synthesis the
+read sees the default `0`: SDA is never driven during payload bytes and **every
+I2C data byte goes out as `0xFF`**. The address byte is driven from the FSM
+directly, so the SI5351 still ACKs and nothing reports an error. The boot
+sequencer's writes all became "register `0xFF` <- `0xFF`".
+
+Evidence, on the Jetson Orin Nano board:
+
+- Draining the I2C master's RX FIFO before each transaction, `0x60` ACKs and other
+  addresses NACK, but multi-byte reads return `00 11 F8 03` **for any register
+  pointer**: register `0xFF`, then a wrap to `0x00` (`0x11`) and `0x01` (`0xF8`,
+  the power-up sticky bits, never cleared). The pointer write itself was `0xFF`.
+- Migen simulation of the PHY is correct; it iterates comb logic to a fixpoint.
+  Vivado xsim of the *generated* Verilog puts `11111111 11111111` on SDA for a
+  `0x07, 0x01` write with LiteX `2ebe242f7`, and `00000111 00000001` with LiteX
+  master.
+- Rebuilt with LiteX `8e0e71c60`: clk-test `AD9361 Ref Clk 38.40`, `Time Ref Clk
+  100.00`, SI5351 registers read back exactly the boot table, board time
+  advances, `DATA_CLK` is exactly `2 x Fs`, DMA streams without the synchronizer
+  bypass, and 735 MHz LTE PSDs line up with a bladeRF 2.0.
+
+LiteX fixed this on 2026-07-07 (`fd69861c6`, `acb25fa66`). Our environment had
+pinned `2ebe242f7`, inside the broken window, which is why the 2026-08-07 and
+later builds were bad while the vendor's 2026-05-15 image (older LiteX) was fine.
+`scripts/check_verilog_comb_order.py` detects the pattern in any build's Verilog.
+
+The rest of this document is the August investigation, kept for the
+measurements; the "SI5351 observations" below are explained by the above.
+
+## Conclusion, corrected (2026-08-13)
 
 **The clock is fine. The 2026-08-07 gateware was not.**
 
@@ -75,7 +110,7 @@ The one register that differed was `0x009` (bladeRF `0x17`, ours `0x07`,
 bit 4 = `XO_BYPASS`). That difference is real but, as established above, has no
 measurable effect here.
 
-## SI5351 observations (still unexplained, still true)
+## SI5351 observations (explained 2026-10-20, see Resolution)
 
 These were measured on both gateware builds and are not explained by the above.
 
