@@ -264,6 +264,9 @@ int main(int argc, char **argv)
             }
             cfg.rx_gain_mode2 = cfg.rx_gain_mode1;
             cfg.program_rx_gain_modes = true;
+            /* AGC modes ignore explicit gains; drop the manual-gain default. */
+            if (cfg.rx_gain_mode1 != M2SDR_RX_GAIN_MODE_MANUAL)
+                cfg.program_rx_gains = false;
             break;
         case 22:
             if (m2sdr_parse_rx_gain_mode(optarg, &cfg.rx_gain_mode1) != M2SDR_ERR_OK) {
@@ -271,6 +274,8 @@ int main(int argc, char **argv)
                 return 1;
             }
             cfg.program_rx_gain_modes = true;
+            if (cfg.rx_gain_mode1 != M2SDR_RX_GAIN_MODE_MANUAL)
+                cfg.program_rx_gains = false;
             break;
         case 23:
             if (m2sdr_parse_rx_gain_mode(optarg, &cfg.rx_gain_mode2) != M2SDR_ERR_OK) {
@@ -278,6 +283,8 @@ int main(int argc, char **argv)
                 return 1;
             }
             cfg.program_rx_gain_modes = true;
+            if (cfg.rx_gain_mode2 != M2SDR_RX_GAIN_MODE_MANUAL)
+                cfg.program_rx_gains = false;
             break;
         case 24:
             if (m2sdr_cli_parse_bool(optarg, &cfg.agc_pin_enable) != 0) {
