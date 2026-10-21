@@ -642,19 +642,29 @@ static int m2sdr_configure_samplerate(struct ad9361_rf_phy *phy,
         return M2SDR_ERR_INVAL;
     }
 
-    /* Match the historical utility behavior: for the lowest rates, switch the
-     * AD9361 FIRs to x4 interpolation/decimation before programming clocks. */
+    /* Below the AD9361's native rate range the programmable FIR must decimate
+     * /interpolate to make up the difference, using the matching filter table:
+     * the dec2/dec4 tables are 128-tap designs for exactly that, while the
+     * default table is a 64-tap decimate-by-1 design. Selecting the default
+     * table and merely overriding its rx_dec/tx_int field (as this did
+     * previously) hands the hardware a decimate-by-1 filter while telling it
+     * to decimate by 4, which produces no usable samples. Tiering matches the
+     * SoapySDR path in LiteXM2SDRDevice.cpp and bladeRF's rate-driven filter
+     * selection on the same RFIC. */
     if (actual_samplerate < 2500000) {
-        AD9361_RXFIRConfig rx_fir_cfg = rx_fir_config;
-        AD9361_TXFIRConfig tx_fir_cfg = tx_fir_config;
+        const bool use_x4 = (actual_samplerate < 1250000);
+        AD9361_RXFIRConfig rx_fir_cfg = use_x4 ? rx_fir_config_dec4 : rx_fir_config_dec2;
+        AD9361_TXFIRConfig tx_fir_cfg = use_x4 ? tx_fir_config_int4 : tx_fir_config_int2;
+        const uint8_t factor = use_x4 ? 4 : 2;
 
-        M2SDR_LOGF("Setting TX/RX FIR Interpolation/Decimation to 4 (< 2.5 Msps Samplerate).\n");
-        phy->rx_fir_dec    = 4;
-        phy->tx_fir_int    = 4;
+        M2SDR_LOGF("Setting TX/RX FIR Interpolation/Decimation to %u (%s Msps Samplerate).\n",
+            factor, use_x4 ? "< 1.25" : "< 2.5");
+        phy->rx_fir_dec    = factor;
+        phy->tx_fir_int    = factor;
         phy->bypass_rx_fir = 0;
         phy->bypass_tx_fir = 0;
-        rx_fir_cfg.rx_dec         = 4;
-        tx_fir_cfg.tx_int         = 4;
+        rx_fir_cfg.rx_dec         = factor;
+        tx_fir_cfg.tx_int         = factor;
 
         if (m2sdr_from_ad9361_rc(ad9361_set_rx_fir_config(phy, rx_fir_cfg)) != M2SDR_ERR_OK)
             return M2SDR_ERR_IO;
@@ -1985,10 +1995,21 @@ static int m2sdr_configure_datapath(struct m2sdr_dev *dev, struct ad9361_rf_phy 
         return rc;
 
     /* Re-apply the default FIR tables after the sample-rate step so the
-     * AD9361 state stays aligned with the shipped utility behavior. */
-    if (m2sdr_from_ad9361_rc(ad9361_set_tx_fir_config(phy, tx_fir_config)) != M2SDR_ERR_OK)
+     * AD9361 state stays aligned with the shipped utility behavior.
+     *
+     * Only do this while the FIR is still bypassed. Below 2.5 MSPS
+     * m2sdr_configure_samplerate() installs the 128-tap dec4/int4 profile,
+     * enables the filter, and programs the clock chain for a x4 rate ratio;
+     * re-applying the 64-tap dec1/int1 defaults on top of that leaves an
+     * enabled filter decimating by 4 while loaded with a decimate-by-1
+     * coefficient set, which yields no usable samples. bladeRF, on the same
+     * RFIC and no-OS driver, never re-applies a FIR after a rate change -
+     * its rate-driven selection is authoritative. */
+    if (phy->bypass_tx_fir &&
+        m2sdr_from_ad9361_rc(ad9361_set_tx_fir_config(phy, tx_fir_config)) != M2SDR_ERR_OK)
         return M2SDR_ERR_IO;
-    if (m2sdr_from_ad9361_rc(ad9361_set_rx_fir_config(phy, rx_fir_config)) != M2SDR_ERR_OK)
+    if (phy->bypass_rx_fir &&
+        m2sdr_from_ad9361_rc(ad9361_set_rx_fir_config(phy, rx_fir_config)) != M2SDR_ERR_OK)
         return M2SDR_ERR_IO;
 
     rc = m2sdr_configure_gains(phy, cfg, channel_layout);
