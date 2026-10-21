@@ -735,12 +735,17 @@ static int m2sdr_configure_gains(struct ad9361_rf_phy *phy,
             m2sdr_to_ad9361_gain_mode(cfg->rx_gain_mode2, &mode2) != M2SDR_ERR_OK)
             return M2SDR_ERR_INVAL;
 
-        M2SDR_LOGF("Setting RX gain control mode to %s and %s.\n",
-            m2sdr_rx_gain_mode_name(cfg->rx_gain_mode1),
-            m2sdr_rx_gain_mode_name(cfg->rx_gain_mode2));
+        if (second_channel)
+            M2SDR_LOGF("Setting RX gain control mode to %s and %s.\n",
+                m2sdr_rx_gain_mode_name(cfg->rx_gain_mode1),
+                m2sdr_rx_gain_mode_name(cfg->rx_gain_mode2));
+        else
+            M2SDR_LOGF("Setting RX gain control mode to %s.\n",
+                m2sdr_rx_gain_mode_name(cfg->rx_gain_mode1));
         if (m2sdr_from_ad9361_rc(ad9361_set_rx_gain_control_mode(phy, 0, mode1)) != M2SDR_ERR_OK)
             return M2SDR_ERR_IO;
-        if (m2sdr_from_ad9361_rc(ad9361_set_rx_gain_control_mode(phy, 1, mode2)) != M2SDR_ERR_OK)
+        if (second_channel &&
+            m2sdr_from_ad9361_rc(ad9361_set_rx_gain_control_mode(phy, 1, mode2)) != M2SDR_ERR_OK)
             return M2SDR_ERR_IO;
         return M2SDR_ERR_OK;
     }
