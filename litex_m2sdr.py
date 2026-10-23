@@ -336,12 +336,20 @@ class BaseSoC(SoCMini):
         with_jtagbone          = True,
         with_gpio              = False,
         pps_input              = "m2",
+        pps_forward            = None,
         with_rfic_oversampling = False,
         with_rfic_rx_timestamp = False,
         with_rx_gain_tag       = True,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
+        if pps_forward is not None:
+            if pps_forward not in ("tp1", "tp2"):
+                raise ValueError("PPS forward output must be TP1 or TP2.")
+            if pps_forward == pps_input:
+                raise ValueError("PPS forward output cannot be the PPS input pin.")
+            if with_gpio:
+                raise ValueError("PPS forward on TP1/TP2 cannot be used with --with-gpio.")
 
         if with_pcie_ptm and not with_pcie:
             raise ValueError("PCIe PTM requires PCIe to be enabled")
@@ -513,7 +521,12 @@ class BaseSoC(SoCMini):
             pps_pad = platform.request("pps_in")
         else:
             pps_pad = platform.request(f"pps_in_{pps_input}")
-        self.pps_in = PPSInput(pps_pad)
+        self.pps_in = PPSInput(pps_pad, time=self.time_gen.time)
+
+        # Forward the external PPS to a test point (e.g. a host PPS GPIO), straight from the input
+        # pad: IBUF -> OBUF, a few ns and no clock quantization.
+        if pps_forward is not None:
+            self.comb += platform.request(f"pps_out_{pps_forward}").eq(pps_pad)
 
         self.pps_gen = PPSGenerator(
             clk_freq = sys_clk_freq,
@@ -907,6 +920,10 @@ class BaseSoC(SoCMini):
             # Per-word AD9361 CTRL_OUT gain byte, consumed by the RX header gain tag.
             with_rx_gain      = with_rx_gain_tag,
         )
+        if with_rfic_rx_timestamp:
+            # Latch the RX timestamp counter on each external PPS edge (pps_in_rfic_cycles CSR):
+            # maps rfic_clk cycles, and so sample times, onto the PPS second.
+            self.pps_in.add_cycle_latch(self.ad9361.rx_timestamp, cd="rfic", name="rfic")
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
 
@@ -1780,6 +1797,7 @@ def main():
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
     parser.add_argument("--with-rx-gain-tag", action=argparse.BooleanOptionalAction, default=True,
         help="Tag each RX DMA header with the AD9361 RX1 gain index over its frame (default on; not with --with-rfic-oversampling).")
+    parser.add_argument("--with-rfic-rx-timestamp", action="store_true", help="Add a per-word rfic_clk timestamp to the RX stream and latch it on PPS edges.")
 
     # PCIe parameters.
     parser.add_argument("--with-pcie",       action="store_true", help="Enable PCIe Communication.")
@@ -1813,6 +1831,8 @@ def main():
     parser.add_argument("--with-gpio",       action="store_true",     help="Enable GPIO support.")
     parser.add_argument("--pps-input", default="m2", choices=["m2", "tp1", "tp2"],
         help="PPS input pin (M.2 PPS_IN, TP1, or TP2).")
+    parser.add_argument("--pps-forward", default=None, choices=["tp1", "tp2"],
+        help="Forward the PPS input to TP1 or TP2 (e.g. to a host PPS GPIO).")
 
     # White Rabbit parameters.
     parser.add_argument("--with-white-rabbit",   action="store_true",                        help="Enable White-Rabbit Support.")
@@ -1888,6 +1908,7 @@ def main():
         # RFIC.
         with_rfic_oversampling = args.with_rfic_oversampling,
         with_rx_gain_tag       = args.with_rx_gain_tag,
+        with_rfic_rx_timestamp = args.with_rfic_rx_timestamp,
 
         # PCIe.
         with_pcie     = args.with_pcie,
@@ -1920,6 +1941,7 @@ def main():
         # GPIOs.
         with_gpio     = args.with_gpio,
         pps_input     = args.pps_input,
+        pps_forward   = args.pps_forward,
         with_jtagbone = not args.without_jtagbone,
 
         # White Rabbit.

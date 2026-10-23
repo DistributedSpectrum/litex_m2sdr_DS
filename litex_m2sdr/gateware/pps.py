@@ -13,16 +13,25 @@ from litex.soc.interconnect.csr import *
 
 from litex.gen.genlib.misc import WaitTimer
 
+from litex_m2sdr.gateware.cdc import ValueStrobeCDC
+
 # PPS Input ---------------------------------------------------------------------------------------
 
 class PPSInput(LiteXModule):
-    """Synchronize and monitor a 3.3V external PPS input in the sys domain."""
-    def __init__(self, pad):
+    """Synchronize and monitor a 3.3V external PPS input in the sys domain.
+
+    With `time` (sys-domain board time in ns), each rising edge also latches that time. A counter
+    in another clock domain (e.g. the rfic_clk RX timestamp) can be latched on the same edge with
+    add_cycle_latch(). Both latches see the edge 2 cycles after the pin (MultiReg) in their own
+    domain: a fixed offset, plus up to one cycle of sampling uncertainty.
+    """
+    def __init__(self, pad, time=None):
         self._status = CSRStatus(fields=[
             CSRField("level", size=1, description="Synchronized PPS input level."),
             CSRField("pulse", size=1, description="One-cycle pulse on PPS rising edge."),
         ])
         self._count  = CSRStatus(32, description="Number of detected PPS rising edges.")
+        self.pad     = pad
         self.pulse   = Signal()
         self.level   = Signal()
         self.count   = Signal(32)
@@ -32,10 +41,12 @@ class PPSInput(LiteXModule):
         # Synchronize the asynchronous M.2 input before edge detection.
         self.specials += MultiReg(pad, self.level)
         previous = Signal()
+        edge     = Signal()
+        self.comb += edge.eq(self.level & ~previous)
         self.sync += [
             previous.eq(self.level),
-            self.pulse.eq(self.level & ~previous),
-            If(self.level & ~previous,
+            self.pulse.eq(edge),
+            If(edge,
                 self.count.eq(self.count + 1)
             ),
         ]
@@ -44,6 +55,39 @@ class PPSInput(LiteXModule):
             self._status.fields.pulse.eq(self.pulse),
             self._count.status.eq(self.count),
         ]
+
+        # Board time latched on each rising edge.
+        if time is not None:
+            self._time = CSRStatus(len(time), description="Board time (ns) latched on the last PPS rising edge.")
+            self.time  = Signal(len(time))
+            self.sync += If(edge, self.time.eq(time))
+            self.comb += self._time.status.eq(self.time)
+
+    def add_cycle_latch(self, counter, cd, name="rfic"):
+        """Latch `counter` (in clock domain `cd`) on each PPS rising edge, read back as the
+        <name>_cycles CSR. The edge is detected in `cd` itself, so the latch has that domain's
+        resolution; the value then crosses to sys."""
+        level    = Signal()
+        previous = Signal()
+        edge     = Signal()
+        self.specials += MultiReg(self.pad, level, odomain=cd)
+        self.comb += edge.eq(level & ~previous)
+        sync_cd  = getattr(self.sync, cd)
+        sync_cd += previous.eq(level)
+
+        cycles_cdc = ValueStrobeCDC(len(counter), cd_from=cd, cd_to="sys")
+        cycles     = Signal(len(counter))
+        csr        = CSRStatus(len(counter), name=f"{name}_cycles",
+            description=f"{name} cycle count latched on the last PPS rising edge.")
+        setattr(self, f"{name}_cycles_cdc", cycles_cdc)
+        setattr(self, f"_{name}_cycles", csr)
+        setattr(self, f"{name}_cycles", cycles)
+        self.comb += [
+            cycles_cdc.strobe.eq(edge),
+            cycles_cdc.value.eq(counter),
+            csr.status.eq(cycles),
+        ]
+        self.sync += If(cycles_cdc.strobe_o, cycles.eq(cycles_cdc.value_o))
 
 # PPS Generator ------------------------------------------------------------------------------------
 
