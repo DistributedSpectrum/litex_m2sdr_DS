@@ -412,10 +412,36 @@ def test_main_passes_pps_forward_and_rfic_rx_timestamp(monkeypatch):
 @pytest.mark.parametrize("kwargs, match", [
     ({"pps_input": "tp2", "pps_forward": "tp2"}, "cannot be the PPS input pin"),
     ({"pps_forward": "tp1", "with_gpio": True},  "cannot be used with --with-gpio"),
-    ({"pps_forward": "m2"},                      "must be TP1 or TP2"),
+    ({"pps_forward": "tp3"},                     "must be M.2 PPS_OUT, TP1 or TP2"),
 ])
 def test_base_soc_rejects_invalid_pps_forward(kwargs, match):
     soc_mod = _load_soc_module()
 
     with pytest.raises(ValueError, match=match):
         soc_mod.BaseSoC(**kwargs)
+
+
+def test_main_accepts_m2_pps_forward_with_m2_input(monkeypatch):
+    soc_mod = _load_soc_module()
+    captured = {}
+
+    class FakeSoC:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    class FakeBuilder:
+        def __init__(self, soc, **kwargs):
+            self.gateware_dir = "build/fake/gateware"
+
+        def build(self, build_name, run):
+            pass
+
+    monkeypatch.setattr(soc_mod, "BaseSoC", FakeSoC)
+    monkeypatch.setattr(soc_mod, "Builder", FakeBuilder)
+    monkeypatch.setattr(soc_mod, "generate_litepcie_software", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["litex_m2sdr.py", "--pps-forward=m2"])
+
+    soc_mod.main()
+
+    assert captured["kwargs"]["pps_input"] == "m2"
+    assert captured["kwargs"]["pps_forward"] == "m2"

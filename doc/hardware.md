@@ -55,10 +55,11 @@ TP1 and TP2 are general-purpose test points on FPGA pins E22 and D22. The select
 
 Each rising edge also latches the board time into the `pps_in_time` CSR (ns). With `--with-rfic-rx-timestamp`, the same edge latches the RX timestamp counter (rfic_clk cycles) into `pps_in_rfic_cycles`, which maps sample times onto the PPS second; the difference between two consecutive latches is the rfic_clk frequency against the PPS reference. Both latches see the edge 2 cycles after the pin in their own clock domain (MultiReg), so they carry a fixed offset plus up to one cycle of sampling uncertainty (8 ns sys, ~4 ns rfic).
 
-`--pps-forward=tp1|tp2` copies the PPS input straight to the other test point (input buffer to output buffer, no clock), for example to also feed a host PPS GPIO. It cannot be the PPS input pin itself or be combined with `--with-gpio`. The output is 3.3V: check the receiving GPIO's voltage first.
+`--pps-forward=m2|tp1|tp2` copies the PPS input straight to M.2 pin 24 (`PPS_OUT`) or to a test point (input buffer to output buffer, no clock), for example to also feed a host PPS GPIO. `m2` drives pin 24, so it combines with the default M.2 pin 22 input; a TP1/TP2 forward cannot be the PPS input pin itself or be combined with `--with-gpio`. The output is 3.3V: check the receiving GPIO's voltage first.
 
 ```sh
-./litex_m2sdr.py --pps-input=tp1 --pps-forward=tp2 --with-rfic-rx-timestamp --build
+./litex_m2sdr.py --pps-input=m2  --pps-forward=m2  --with-rfic-rx-timestamp --build # M.2 pin 22 in, pin 24 out.
+./litex_m2sdr.py --pps-input=tp1 --pps-forward=tp2 --with-rfic-rx-timestamp --build # TP1 in, TP2 out.
 ```
 
 ## User LED Behavior
