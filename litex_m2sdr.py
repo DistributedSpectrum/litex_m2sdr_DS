@@ -333,6 +333,7 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         pps_input              = "m2",
         with_rfic_oversampling = False,
+        with_rfic_rx_timestamp = False,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
@@ -874,6 +875,8 @@ class BaseSoC(SoCMini):
             # per-lane RX deskew, see gateware/ad9361/phy_oversampling.py) and the 128-bit
             # datapath; the default build keeps the standard PHY and 64-bit datapath unchanged.
             oversampling   = with_rfic_oversampling,
+            # Per-word rfic_clk timestamp on the RX stream handed to add_rfic_datapath().
+            with_rx_timestamp = with_rfic_rx_timestamp,
         )
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
@@ -1323,6 +1326,9 @@ class BaseSoC(SoCMini):
         - Side-band results to the host: the hook runs after the comms sections, so extra DMA
           channels (``pcie_dmas > 1`` / ``--pcie-dmas``) are available here as
           ``self.pcie_dma1``, ...
+        - Sample time: with ``with_rfic_rx_timestamp=True``, ``rfic_source`` also carries a
+          64-bit ``timestamp`` per word, the rfic_clk cycle count at which the word entered the
+          RX RFIC FIFO (see AD9361RFIC). ``rx_sink`` has no such field: omit it when connecting.
 
         Generic DSP building blocks (DDS/NCO, mixers, CIC, FIR, ...) for use here are being
         gathered in LiteDSP: https://github.com/enjoy-digital/litedsp.
@@ -1333,7 +1339,7 @@ class BaseSoC(SoCMini):
         """
         self.comb += [
             tx_source.connect(rfic_sink),
-            rfic_source.connect(rx_sink),
+            rfic_source.connect(rx_sink, omit={"timestamp"}),
         ]
 
     # SATA -----------------------------------------------------------------------------------------

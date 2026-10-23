@@ -21,6 +21,16 @@ _BFP8_MODE   = 2
 BFP8_HEADER_MAGIC    = 0x38504642 # "BFP8" as a little-endian 32-bit word.
 BFP8_PAYLOAD_WORDS   = 127
 
+RX_TIMESTAMP_WIDTH   = 64
+
+def rx_layout(data_width, with_timestamp=False):
+    # RX sample stream layout: dma_layout, plus an optional per-word rfic_clk timestamp (see
+    # AD9361RFIC with_rx_timestamp).
+    layout = [("data", data_width)]
+    if with_timestamp:
+        layout += [("timestamp", RX_TIMESTAMP_WIDTH)]
+    return stream.EndpointDescription(layout)
+
 def _sign_extend(data, nbits=16):
     return Cat(data, Replicate(data[-1], nbits - len(data)))
 
@@ -204,9 +214,9 @@ class AD9361TXBitMode64b(LiteXModule):
 # AD9361 RX BitMode (64-bit) -----------------------------------------------------------------------
 
 class AD9361RXBitMode64b(LiteXModule):
-    def __init__(self, bfp8_payload_words=BFP8_PAYLOAD_WORDS):
-        self.sink   = sink   = stream.Endpoint(dma_layout(64))
-        self.source = source = stream.Endpoint(dma_layout(64))
+    def __init__(self, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False):
+        self.sink   = sink   = stream.Endpoint(rx_layout(64, with_timestamp))
+        self.source = source = stream.Endpoint(rx_layout(64, with_timestamp))
         self.mode   = mode   = Signal(2)
 
         # # #
@@ -218,8 +228,18 @@ class AD9361RXBitMode64b(LiteXModule):
         # 8-bit mode.
         # -----------
         self.conv = conv = stream.Converter(32, 64)
+        if with_timestamp:
+            # Each output word packs two input words: it carries the first one's timestamp.
+            # ts_first_word mirrors the converter's demux (which also restarts on last).
+            ts_first_word = Signal(reset=1)
+            ts_first      = Signal(RX_TIMESTAMP_WIDTH)
+            self.sync += If(conv.sink.valid & conv.sink.ready,
+                If(ts_first_word, ts_first.eq(sink.timestamp)),
+                ts_first_word.eq(~ts_first_word | sink.last),
+            )
+            self.comb += If(mode == _8_BIT_MODE, source.timestamp.eq(ts_first))
         self.comb += If(mode == _8_BIT_MODE,
-            sink.connect(conv.sink, omit={"data"}),
+            sink.connect(conv.sink, omit={"data", "timestamp"}),
             conv.sink.data[0*8:1*8].eq(_round_shift_12_to_8(self, sink.data[0*16:0*16+12])),
             conv.sink.data[1*8:2*8].eq(_round_shift_12_to_8(self, sink.data[1*16:1*16+12])),
             conv.sink.data[2*8:3*8].eq(_round_shift_12_to_8(self, sink.data[2*16:2*16+12])),
@@ -238,6 +258,14 @@ class AD9361RXBitMode64b(LiteXModule):
         bfp8_exponent      = Signal(4)
         bfp8_sequence      = Signal(8)
         bfp8_word0         = Signal(64)
+
+        # A block (header + payload) carries its first input word's timestamp. Blocks do not
+        # overlap (COLLECT only restarts after PAYLOAD), so one register is enough.
+        bfp8_timestamp_latch = []
+        if with_timestamp:
+            bfp8_timestamp = Signal(RX_TIMESTAMP_WIDTH)
+            bfp8_timestamp_latch = [If(bfp8_collect_count == 0, NextValue(bfp8_timestamp, sink.timestamp))]
+            self.comb += If(mode == _BFP8_MODE, source.timestamp.eq(bfp8_timestamp))
 
         sample_abs = [
             _sample_abs(self, sink.data[i*16:i*16 + 12])
@@ -258,6 +286,7 @@ class AD9361RXBitMode64b(LiteXModule):
                 bfp8_fifo.sink.data.eq(sink.data),
                 If(sink.valid & sink.ready,
                     NextValue(bfp8_max_abs, next_max_abs),
+                    *bfp8_timestamp_latch,
                     If(bfp8_collect_count == (bfp8_input_words - 1),
                         NextValue(bfp8_collect_count, 0),
                         NextState("BFP8_EXP"),
@@ -412,12 +441,13 @@ class AD9361RXBitMode(LiteXModule):
     (standard datapath) or AD9361RXBitMode128b (oversampling datapath) and exposes its
     sink/source/mode directly.
     """
-    def __init__(self, data_width=64, bfp8_payload_words=BFP8_PAYLOAD_WORDS):
+    def __init__(self, data_width=64, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False):
         assert data_width in [64, 128]
         if data_width == 128:
+            assert not with_timestamp, "RX timestamps are not supported on the 128-bit datapath."
             self.core = core = AD9361RXBitMode128b()
         else:
-            self.core = core = AD9361RXBitMode64b(bfp8_payload_words)
+            self.core = core = AD9361RXBitMode64b(bfp8_payload_words, with_timestamp)
         self.sink   = core.sink
         self.source = core.source
         self.mode   = core.mode
