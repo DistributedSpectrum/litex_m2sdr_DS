@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cctype>
 #include <limits>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "ad9361/ad9361.h"
 #include "ad9361/ad9361_api.h"
@@ -428,6 +430,24 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
             throw std::runtime_error("RX/TX channel count mismatch; close TX or use matching channels");
         }
 
+        /* Record-to-disk mode (see getStreamArgsInfo()). */
+        _rx_record.path.clear();
+        auto record_arg = [&](const char *key, const char *fallback) {
+            auto i = searchArgs.find(key);
+            return i == searchArgs.end() ? std::string(fallback) : i->second;
+        };
+        if (!record_arg("record", "").empty()) {
+            if (!isLitePCIe())
+                throw std::runtime_error("RX record mode needs a PCIe device");
+            if (format != SOAPY_SDR_CS16 && format != SOAPY_SDR_CS8)
+                throw std::runtime_error("RX record mode writes the native DMA samples: use CS16 or CS8");
+            _rx_record.path          = record_arg("record", "");
+            _rx_record.max_bytes     = std::stoull(record_arg("record_bytes", "0"));
+            _rx_record.chunk_buffers = (unsigned)std::stoul(record_arg("record_chunk", "0"));
+            _rx_record.header        = record_arg("record_header", "0") != "0";
+            _rx_record.direct        = record_arg("record_direct", "1") != "0";
+        }
+
         if (isLitePCIe()) {
             if (format == SOAPY_SDR_CS8) {
                 _bitMode = 8;
@@ -443,9 +463,12 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
             config.direction = M2SDR_RX;
             config.format = m2fmt;
             config.zero_copy = true;
-            config.rx_header_enable = _rx_dma_header_bytes != 0;
-            config.rx_strip_header = _rx_dma_header_bytes != 0;
-            config.buffer_size = m2sdr_bytes_to_samples(m2fmt, M2SDR_BUFFER_BYTES - _rx_dma_header_bytes);
+            /* Record mode writes whole DMA buffers: headers only on request, never stripped. */
+            const bool recording = !_rx_record.path.empty();
+            const unsigned header_bytes = recording ? 0 : _rx_dma_header_bytes;
+            config.rx_header_enable = recording ? _rx_record.header : (_rx_dma_header_bytes != 0);
+            config.rx_strip_header = header_bytes != 0;
+            config.buffer_size = m2sdr_bytes_to_samples(m2fmt, M2SDR_BUFFER_BYTES - header_bytes);
             int rc = m2sdr_stream_configure(_dev, &config);
             if (rc != M2SDR_ERR_OK)
                 throw std::runtime_error("m2sdr_stream_configure(RX) failed: " + std::string(m2sdr_strerror(rc)));
@@ -783,6 +806,7 @@ void SoapyLiteXM2SDR::closeStream(SoapySDR::Stream *stream) {
 
     if (stream == RX_STREAM) {
         stopRxStreamUnlocked();
+        _rx_record.path.clear();
         if (isLitePCIe()) {
             (void)m2sdr_stream_release(_dev, M2SDR_RX);
         } else if (isLiteEth()) {
@@ -835,6 +859,8 @@ int SoapyLiteXM2SDR::activateStream(
             _rx_stream.remainderHandle = -1;
             _rx_stream.remainderSamps = 0;
             _rx_stream.remainderOffset = 0;
+            if (!_rx_record.path.empty() && !startRxRecordUnlocked())
+                return SOAPY_SDR_STREAM_ERROR;
         } else if (isLiteEth()) {
             if (_udp_inited)
                 liteeth_udp_flush_rx(&_udp);
@@ -967,6 +993,7 @@ int SoapyLiteXM2SDR::deactivateStream(
 
 void SoapyLiteXM2SDR::stopRxStreamUnlocked()
 {
+    stopRxRecordUnlocked();
     if (isLitePCIe()) {
         /* Disable the DMA engine for RX. */
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_RX);
@@ -982,6 +1009,74 @@ void SoapyLiteXM2SDR::stopRxStreamUnlocked()
         }
     }
     _rx_stream.burst_end = true;
+}
+
+void SoapyLiteXM2SDR::rxRecordProgress(const struct m2sdr_rx_to_fd_stats *stats, void *user)
+{
+    auto *record = static_cast<RxRecord *>(user);
+    std::lock_guard<std::mutex> lock(record->stats_mutex);
+    record->stats = *stats;
+}
+
+bool SoapyLiteXM2SDR::startRxRecordUnlocked()
+{
+    stopRxRecordUnlocked();
+    int flags = O_WRONLY | O_CREAT | O_TRUNC | (_rx_record.direct ? O_DIRECT : 0);
+    _rx_record.fd = ::open(_rx_record.path.c_str(), flags, 0644);
+    if (_rx_record.fd < 0) {
+        SoapySDR::logf(SOAPY_SDR_ERROR, "RX record: cannot open %s: %s",
+                       _rx_record.path.c_str(), std::strerror(errno));
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(_rx_record.stats_mutex);
+        _rx_record.stats  = m2sdr_rx_to_fd_stats{};
+        _rx_record.result = M2SDR_ERR_OK;
+    }
+    _rx_record.keep_running = 1;
+    _rx_record.running.store(true);
+    _rx_record.thread = std::thread([this]() {
+        struct m2sdr_rx_to_fd_params params;
+        struct m2sdr_rx_to_fd_stats stats;
+        std::memset(&params, 0, sizeof(params));
+        params.fd            = _rx_record.fd;
+        params.max_bytes     = _rx_record.max_bytes;
+        params.chunk_buffers = _rx_record.chunk_buffers;
+        params.keep_running  = &_rx_record.keep_running;
+        params.progress      = rxRecordProgress;
+        params.user          = &_rx_record;
+        int rc = m2sdr_rx_stream_to_fd(_dev, &params, &stats);
+        {
+            std::lock_guard<std::mutex> lock(_rx_record.stats_mutex);
+            _rx_record.stats  = stats;
+            _rx_record.result = rc;
+        }
+        if (rc != M2SDR_ERR_OK)
+            SoapySDR::logf(SOAPY_SDR_ERROR, "RX record: %s", m2sdr_strerror(rc));
+        _rx_record.running.store(false);
+    });
+    SoapySDR::logf(SOAPY_SDR_INFO, "RX record: writing %s%s", _rx_record.path.c_str(),
+                   _rx_record.direct ? " (O_DIRECT)" : "");
+    return true;
+}
+
+void SoapyLiteXM2SDR::stopRxRecordUnlocked()
+{
+    if (_rx_record.thread.joinable()) {
+        _rx_record.keep_running = 0;
+        _rx_record.thread.join();
+        std::lock_guard<std::mutex> lock(_rx_record.stats_mutex);
+        const struct m2sdr_rx_to_fd_stats &st = _rx_record.stats;
+        SoapySDR::logf(SOAPY_SDR_INFO,
+            "RX record: %llu bytes, %llu overflows (%llu buffers), %llu torn writes, max write %.1f ms",
+            (unsigned long long)st.bytes, (unsigned long long)st.overflow_events,
+            (unsigned long long)st.overflow_buffers, (unsigned long long)st.torn_writes,
+            st.max_write_us / 1000.0);
+    }
+    if (_rx_record.fd >= 0) {
+        ::close(_rx_record.fd);
+        _rx_record.fd = -1;
+    }
 }
 
 void SoapyLiteXM2SDR::stopTxStreamUnlocked()
@@ -1329,6 +1424,8 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
 
     if (!_rx_stream.opened || _rx_stream.stop_requested.load())
         return SOAPY_SDR_STREAM_ERROR;
+    if (!_rx_record.path.empty())
+        return SOAPY_SDR_NOT_SUPPORTED; /* The recorder owns the RX ring. */
 
     if (_rx_stream.burst_end)
         flags |= SOAPY_SDR_END_BURST;
@@ -1953,6 +2050,8 @@ int SoapyLiteXM2SDR::readStream(
 
     if (!_rx_stream.opened || _rx_stream.stop_requested.load())
         return SOAPY_SDR_STREAM_ERROR;
+    if (!_rx_record.path.empty())
+        return SOAPY_SDR_NOT_SUPPORTED; /* The recorder owns the RX ring. */
 
     /* Determine the number of samples to return, respecting the MTU. */
     size_t returnedElems = std::min(numElems, this->getStreamMTU(stream));
