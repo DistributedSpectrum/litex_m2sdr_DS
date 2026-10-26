@@ -319,7 +319,7 @@ class BaseSoC(SoCMini):
     }
 
     def __init__(self, variant="m2", sys_clk_freq=int(125e6),
-        with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1, pcie_dmas=1, with_pcie_reset_workaround=False,
+        with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1, pcie_dmas=1, pcie_dma_table_depth=256, with_pcie_reset_workaround=False,
         with_eth               = False, eth_sfp=0, eth_phy="1000basex", eth_local_ip="192.168.1.50", eth_udp_port=2345,
         with_eth_ptp           = False, eth_ptp_p2p=False, eth_ptp_igmp=True, eth_ptp_igmp_interval=2,
         with_eth_ptp_rfic_clock = False,
@@ -339,6 +339,10 @@ class BaseSoC(SoCMini):
 
         if with_pcie_ptm and not with_pcie:
             raise ValueError("PCIe PTM requires PCIe to be enabled")
+
+        # The kernel driver's DMA ring depth (DMA_BUFFER_COUNT) must be a power of two.
+        if not (2 <= pcie_dma_table_depth <= 65536) or (pcie_dma_table_depth & (pcie_dma_table_depth - 1)):
+            raise ValueError("PCIe DMA table depth must be a power of two in 2..65536.")
 
         # Platform ---------------------------------------------------------------------------------
 
@@ -592,6 +596,9 @@ class BaseSoC(SoCMini):
             self.add_pcie(phy=self.pcie_phy, address_width=64, ndmas=pcie_dmas,
                 data_width=128 if with_rfic_oversampling else 64,
                 with_dma_buffering    = True, dma_buffering_depth=8192,
+                # Descriptor table depth = max host DMA ring depth (buffers); the kernel driver
+                # takes DMA_BUFFER_COUNT from the generated DMA_TABLE_DEPTH.
+                dma_table_depth       = pcie_dma_table_depth,
                 with_dma_loopback     = True,
                 with_dma_synchronizer = True,
                 with_msi              = True, msis = pcie_msis,
@@ -1684,6 +1691,7 @@ def main():
     parser.add_argument("--pcie-gen",        default=2, type=int, help="PCIe Generation.", choices=[1, 2])
     parser.add_argument("--pcie-lanes",      default=1, type=int, help="PCIe Lanes.", choices=[1, 2, 4])
     parser.add_argument("--pcie-dmas",       default=1, type=int, help="Number of PCIe DMA channels (subclasses may use >1 for side-band streams).")
+    parser.add_argument("--pcie-dma-table-depth", default=256, type=int, help="PCIe DMA descriptor table depth = max host DMA ring depth in buffers (power of two).")
 
     # Ethernet parameters.
     parser.add_argument("--with-eth",        action="store_true",     help="Enable Ethernet Communication.")
@@ -1789,6 +1797,7 @@ def main():
         pcie_gen      = args.pcie_gen,
         pcie_lanes    = args.pcie_lanes,
         pcie_dmas     = args.pcie_dmas,
+        pcie_dma_table_depth = args.pcie_dma_table_depth,
 
         # Ethernet.
         with_eth      = args.with_eth,

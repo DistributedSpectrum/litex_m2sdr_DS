@@ -345,3 +345,36 @@ def test_base_soc_rejects_pcie_eth_sata_triple_use():
             with_sata=True,
             with_jtagbone=False,
         )
+
+
+def test_main_passes_pcie_dma_table_depth(monkeypatch):
+    soc_mod = _load_soc_module()
+    captured = {}
+
+    class FakeSoC:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    class FakeBuilder:
+        def __init__(self, soc, **kwargs):
+            self.gateware_dir = "build/fake/gateware"
+
+        def build(self, build_name, run):
+            pass
+
+    monkeypatch.setattr(soc_mod, "BaseSoC", FakeSoC)
+    monkeypatch.setattr(soc_mod, "Builder", FakeBuilder)
+    monkeypatch.setattr(soc_mod, "generate_litepcie_software", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["litex_m2sdr.py", "--pcie-dma-table-depth=2048"])
+
+    soc_mod.main()
+
+    assert captured["kwargs"]["pcie_dma_table_depth"] == 2048
+
+
+@pytest.mark.parametrize("depth", [1, 1000, 131072])
+def test_base_soc_rejects_invalid_pcie_dma_table_depth(depth):
+    soc_mod = _load_soc_module()
+
+    with pytest.raises(ValueError, match="power of two"):
+        soc_mod.BaseSoC(pcie_dma_table_depth=depth)
