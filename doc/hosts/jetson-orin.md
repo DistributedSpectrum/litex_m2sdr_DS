@@ -197,6 +197,9 @@ copies runs of 256 into a 256 MiB RAM queue (the one copy; O_DIRECT cannot read 
 and a writer thread writes them with O_DIRECT. Disk stalls fill the queue instead of the DMA ring:
 on a KingSpec XG7000 1 TB (MAXIO MAP1602, Gen4 x1 through the E-key slot), 100 GB had 89 overflows
 before the queue (write stalls up to 38 ms) and 0 with it (stalls up to 36.5 ms, queue peak 18 MB).
+A 350 GiB fio run on the same drive (2 MiB O_DIRECT writes, one at a time) averaged 963 MB/s with no
+write-cache cliff and never fell below 690 MB/s in any second, but single writes stalled for up to
+141 ms (p99.99 95 ms): more than the DMA ring can hold, well within the queue.
 The original PNY CS2142 cannot sustain the rate past its ~38 GB write cache (~85 MB/s after). It needs no sysctl, `chrt` or `--host-buffers`. A run with `--enable-header` checked
 all 1.8 M buffer timestamps: no gaps or repeats. Its peak backlog is past the old 256-buffer ring's
 128-buffer overflow budget, so build the gateware with `--pcie-dma-table-depth=2048`.
