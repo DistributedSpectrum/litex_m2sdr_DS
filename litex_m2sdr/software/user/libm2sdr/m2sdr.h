@@ -1068,6 +1068,13 @@ int m2sdr_rx_stream_to_fd(struct m2sdr_dev *dev,
                           const struct m2sdr_rx_to_fd_params *params,
                           struct m2sdr_rx_to_fd_stats *stats);
 
+/* Trim the free space of the filesystem holding path, as fstrim does, so an SSD can rebuild its
+ * dynamic write cache before the next capture (run it after deleting old captures; the cache
+ * refills while the drive idles). Uses the FITRIM ioctl when the caller has CAP_SYS_ADMIN
+ * (trimmed_bytes, if given, is then set); otherwise runs "sudo -n fstrim <mountpoint>", which
+ * needs a NOPASSWD sudoers rule for fstrim. Returns M2SDR_ERR_IO if neither works. */
+int m2sdr_fstrim(const char *path, uint64_t *trimmed_bytes);
+
 /* Small utility helpers for buffer sizing and allocation. */
 size_t m2sdr_format_size(enum m2sdr_format format);
 size_t m2sdr_samples_to_bytes(enum m2sdr_format format, unsigned num_samples);

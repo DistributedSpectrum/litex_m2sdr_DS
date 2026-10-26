@@ -2828,6 +2828,9 @@ SoapySDR::ArgInfoList SoapyLiteXM2SDR::getStreamArgsInfo(const int direction, co
         "Write with O_DIRECT, bypassing the page cache (recommended for full-rate recording).");
     add("record_chunk", "0", "Buffers per write", SoapySDR::ArgInfo::INT,
         "DMA buffers per write() (0: 256; at most half the ring).");
+    add("record_fstrim", "1", "fstrim after capture", SoapySDR::ArgInfo::BOOL,
+        "Trim the file's filesystem when the capture stops, so the SSD can rebuild its write cache "
+        "for the next one (needs root, or a NOPASSWD sudoers rule for fstrim).");
     return infos;
 }
 

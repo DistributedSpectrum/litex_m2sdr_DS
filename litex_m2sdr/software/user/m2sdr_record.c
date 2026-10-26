@@ -71,7 +71,9 @@ static void help(void)
     puts("      --strip-header    Strip DMA header from output.");
     puts("      --host-buffers N  Queue N DMA buffers before writing output.");
     puts("      --direct          Write straight from the DMA ring to the file (PCIe, zero-copy,");
-    puts("                        O_DIRECT); headers, if enabled, stay in the data.");
+    puts("                        O_DIRECT); headers, if enabled, stay in the data. Runs fstrim on");
+    puts("                        the file's filesystem afterwards (needs root or sudo for fstrim).");
+    puts("      --no-fstrim       With --direct: skip the fstrim after the capture.");
     puts("");
     puts("SigMF output:");
     puts("      --sigmf           Write a SigMF dataset + metadata pair.");
@@ -426,7 +428,8 @@ static void record_direct_progress(const struct m2sdr_rx_to_fd_stats *stats, voi
 
 static void m2sdr_record_direct(const char *device_id, const char *filename, size_t size,
                                 uint8_t quiet, uint8_t header, enum m2sdr_format format,
-                                bool sigmf_enable, struct m2sdr_sigmf_meta *sigmf_meta)
+                                bool sigmf_enable, struct m2sdr_sigmf_meta *sigmf_meta,
+                                bool fstrim)
 {
     struct m2sdr_dev *dev = NULL;
     enum m2sdr_transport_kind transport = M2SDR_TRANSPORT_KIND_UNKNOWN;
@@ -515,6 +518,16 @@ cleanup:
         close(fd);
     if (dev)
         m2sdr_close(dev);
+    /* Let the SSD rebuild its dynamic write cache before the next capture. */
+    if (fstrim && exit_status == 0) {
+        uint64_t trimmed = 0;
+        rc = m2sdr_fstrim(filename, &trimmed);
+        if (rc != M2SDR_ERR_OK)
+            fprintf(stderr, "fstrim after capture failed (%s): run as root, or allow "
+                            "\"sudo -n fstrim\" for this user\n", m2sdr_strerror(rc));
+        else if (!quiet)
+            fprintf(stderr, "fstrim: done%s\n", trimmed ? "" : " (via sudo)");
+    }
     if (exit_status != 0)
         exit(1);
 }
@@ -810,6 +823,7 @@ int main(int argc, char **argv)
     static enum m2sdr_format format = M2SDR_FORMAT_SC16_Q11;
     static unsigned host_buffers = 0;
     static uint8_t direct = 0;
+    static uint8_t no_fstrim = 0;
     double ts_jump_threshold_pct = 5.0;
     struct m2sdr_sigmf_meta sigmf_meta;
     struct m2sdr_sigmf_annotation pending_annotation;
@@ -842,6 +856,7 @@ int main(int argc, char **argv)
         { "ts-jump-threshold-pct", required_argument, NULL, 17 },
         { "host-buffers", required_argument, NULL, 18 },
         { "direct", no_argument, NULL, 19 },
+        { "no-fstrim", no_argument, NULL, 20 },
         { "format", required_argument, NULL, 1 },
         { "8bit", no_argument, NULL, 2 },
         { NULL, 0, NULL, 0 }
@@ -978,6 +993,9 @@ int main(int argc, char **argv)
         case 19:
             direct = 1;
             break;
+        case 20:
+            no_fstrim = 1;
+            break;
         default:
             exit(1);
         }
@@ -1059,7 +1077,7 @@ int main(int argc, char **argv)
             return 1;
         }
         m2sdr_record_direct(m2sdr_cli_device_id(&cli_dev), filename, size, quiet, header, format,
-                            sigmf_enable ? true : false, &sigmf_meta);
+                            sigmf_enable ? true : false, &sigmf_meta, !no_fstrim);
         return 0;
     }
 

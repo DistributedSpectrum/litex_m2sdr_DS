@@ -583,6 +583,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         unsigned chunk_buffers = 0;       /* 0: library default.                         */
         bool header = false;              /* Keep the 16-byte DMA headers in the file.   */
         bool direct = true;               /* O_DIRECT (bypass the page cache).            */
+        bool fstrim = true;               /* fstrim the filesystem once the capture stops. */
         int fd = -1;
         volatile int keep_running = 0;
         std::thread thread;

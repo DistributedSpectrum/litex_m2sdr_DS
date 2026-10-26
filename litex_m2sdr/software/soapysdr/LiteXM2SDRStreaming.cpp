@@ -446,6 +446,7 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
             _rx_record.chunk_buffers = (unsigned)std::stoul(record_arg("record_chunk", "0"));
             _rx_record.header        = record_arg("record_header", "0") != "0";
             _rx_record.direct        = record_arg("record_direct", "1") != "0";
+            _rx_record.fstrim        = record_arg("record_fstrim", "1") != "0";
         }
 
         if (isLitePCIe()) {
@@ -1076,6 +1077,17 @@ void SoapyLiteXM2SDR::stopRxRecordUnlocked()
     if (_rx_record.fd >= 0) {
         ::close(_rx_record.fd);
         _rx_record.fd = -1;
+        /* Let the SSD rebuild its dynamic write cache before the next capture. */
+        if (_rx_record.fstrim) {
+            uint64_t trimmed = 0;
+            int rc = m2sdr_fstrim(_rx_record.path.c_str(), &trimmed);
+            if (rc != M2SDR_ERR_OK)
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX record: fstrim after capture failed (%s): run as root, or allow "
+                    "\"sudo -n fstrim\" for this user (record_fstrim=0 to skip)", m2sdr_strerror(rc));
+            else
+                SoapySDR::logf(SOAPY_SDR_INFO, "RX record: fstrim done%s", trimmed ? "" : " (via sudo)");
+        }
     }
 }
 

@@ -175,6 +175,7 @@ sustains 122.88 MSPS sc16 (491.5 MB/s) to NVMe on a Jetson Orin Nano with no dro
 | `record_header` | `0` | Keep the 16-byte DMA header (sync word + ns timestamp) in every 8 KiB buffer |
 | `record_direct` | `1` | O_DIRECT (bypass the page cache) |
 | `record_chunk` | `0` | DMA buffers per write (0: 256, at most half the ring) |
+| `record_fstrim` | `1` | Trim the file's filesystem when the capture stops (needs root or `sudo -n fstrim`) |
 
 `readSetting("rx_record_status")` reports `running`, `bytes`, `buffers`, `overflows`,
 `overflow_buffers`, `torn_writes`, `high_water`, `max_write_ms` and `result`. Full rate needs the
