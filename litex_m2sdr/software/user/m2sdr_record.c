@@ -8,6 +8,12 @@
  *
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* O_DIRECT (--direct). */
+#endif
+
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -64,6 +70,8 @@ static void help(void)
     puts("      --enable-header   Enable DMA header.");
     puts("      --strip-header    Strip DMA header from output.");
     puts("      --host-buffers N  Queue N DMA buffers before writing output.");
+    puts("      --direct          Write straight from the DMA ring to the file (PCIe, zero-copy,");
+    puts("                        O_DIRECT); headers, if enabled, stay in the data.");
     puts("");
     puts("SigMF output:");
     puts("      --sigmf           Write a SigMF dataset + metadata pair.");
@@ -397,6 +405,120 @@ static bool record_submit_payload(FILE *fo, struct m2sdr_record_sink *sink, cons
     return true;
 }
 
+/* --direct: DMA ring -> file with no copy (m2sdr_rx_stream_to_fd). */
+static void record_direct_progress(const struct m2sdr_rx_to_fd_stats *stats, void *user)
+{
+    uint64_t *last = user;   /* [0] = time (ms), [1] = bytes, [2] = lines printed. */
+    int64_t   now  = get_time_ms();
+
+    if (last[0] && now > (int64_t)last[0]) {
+        double gbps = (double)(stats->bytes - last[1]) * 8 / ((double)(now - (int64_t)last[0]) * 1e6);
+        if (last[2]++ % 10 == 0)
+            fprintf(stderr, "\e[1m%10s %10s %9s %9s %12s\e[0m\n",
+                    "SPEED(Gbps)", "BUFFERS", "SIZE(MB)", "OVERFLOWS", "MAXWRITE(ms)");
+        fprintf(stderr, "%11.2f %10" PRIu64 " %9" PRIu64 " %9" PRIu64 " %12.1f\n",
+                gbps, stats->buffers, stats->bytes / 1024 / 1024, stats->overflow_events,
+                stats->max_write_us / 1000.0);
+    }
+    last[0] = (uint64_t)now;
+    last[1] = stats->bytes;
+}
+
+static void m2sdr_record_direct(const char *device_id, const char *filename, size_t size,
+                                uint8_t quiet, uint8_t header, enum m2sdr_format format,
+                                bool sigmf_enable, struct m2sdr_sigmf_meta *sigmf_meta)
+{
+    struct m2sdr_dev *dev = NULL;
+    enum m2sdr_transport_kind transport = M2SDR_TRANSPORT_KIND_UNKNOWN;
+    struct m2sdr_sync_params params;
+    struct m2sdr_rx_to_fd_params out;
+    struct m2sdr_rx_to_fd_stats stats;
+    uint64_t progress[3] = {0, 0, 0};
+    int fd = -1;
+    int rc;
+    int exit_status = 1;
+
+    if (m2sdr_open(&dev, device_id) != 0) {
+        fprintf(stderr, "Could not open device: %s\n", device_id);
+        exit(1);
+    }
+    if (m2sdr_get_transport(dev, &transport) != 0 || transport != M2SDR_TRANSPORT_KIND_LITEPCIE) {
+        fprintf(stderr, "--direct needs a PCIe device\n");
+        goto cleanup;
+    }
+    if (m2sdr_set_sample_format(dev, format) != 0) {
+        fprintf(stderr, "m2sdr_set_sample_format failed\n");
+        goto cleanup;
+    }
+    if (sigmf_enable)
+        sigmf_fill_defaults_from_device(dev, sigmf_meta);
+
+    fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (fd < 0) {
+        perror(filename);
+        goto cleanup;
+    }
+
+    m2sdr_sync_params_init(&params);
+    params.direction        = M2SDR_RX;
+    params.format           = format;
+    params.zero_copy        = true;
+    params.rx_header_enable = header ? true : false;
+    params.rx_strip_header  = false;
+    params.buffer_size      = m2sdr_bytes_to_samples(format, M2SDR_BUFFER_BYTES);
+    rc = m2sdr_sync_config_ex(dev, &params);
+    if (rc != M2SDR_ERR_OK) {
+        fprintf(stderr, "m2sdr_sync_config_ex failed: %s\n", m2sdr_strerror(rc));
+        goto cleanup;
+    }
+
+    memset(&out, 0, sizeof(out));
+    out.fd           = fd;
+    out.max_bytes    = size;
+    out.keep_running = &keep_running;
+    out.progress     = quiet ? NULL : record_direct_progress;
+    out.user         = progress;
+    rc = m2sdr_rx_stream_to_fd(dev, &out, &stats);
+    if (rc != M2SDR_ERR_OK) {
+        fprintf(stderr, "m2sdr_rx_stream_to_fd failed: %s (%s)\n", m2sdr_strerror(rc), strerror(errno));
+        goto cleanup;
+    }
+    if (!quiet)
+        fprintf(stderr, "Direct RX: bytes=%" PRIu64 " buffers=%" PRIu64 " writes=%" PRIu64
+                " max_write=%.1fms high_water=%" PRIu64 " overflows=%" PRIu64
+                " overflow_buffers=%" PRIu64 " torn_writes=%" PRIu64 "\n",
+                stats.bytes, stats.buffers, stats.writes, stats.max_write_us / 1000.0,
+                stats.ring_high_water, stats.overflow_events, stats.overflow_buffers,
+                stats.torn_writes);
+
+    if (sigmf_enable) {
+        char data_path[1024] = {0};
+        char meta_path[1024] = {0};
+        unsigned sample_size = m2sdr_format_size(format);
+
+        if (m2sdr_sigmf_derive_paths(filename, data_path, sizeof(data_path),
+                                     meta_path, sizeof(meta_path)) != 0) {
+            fprintf(stderr, "Could not derive SigMF paths from %s\n", filename);
+        } else {
+            snprintf(sigmf_meta->data_path, sizeof(sigmf_meta->data_path), "%s", data_path);
+            snprintf(sigmf_meta->meta_path, sizeof(sigmf_meta->meta_path), "%s", meta_path);
+            sigmf_finalize_annotation_ranges(sigmf_meta, sample_size ? stats.bytes / sample_size : 0);
+            if (m2sdr_sigmf_write(sigmf_meta) != 0)
+                fprintf(stderr, "Failed to write SigMF metadata: %s\n", meta_path);
+        }
+    }
+    exit_status = 0;
+
+cleanup:
+    print_stream_summary(dev, quiet);
+    if (fd >= 0)
+        close(fd);
+    if (dev)
+        m2sdr_close(dev);
+    if (exit_status != 0)
+        exit(1);
+}
+
 static void m2sdr_record(const char *device_id, const char *filename, size_t size, uint8_t quiet,
                          uint8_t header, uint8_t strip_header, enum m2sdr_format format,
                          bool sigmf_enable, bool annotate_ts_jumps, double ts_jump_threshold_pct,
@@ -687,6 +809,7 @@ int main(int argc, char **argv)
     static uint8_t annotate_ts_jumps = 0;
     static enum m2sdr_format format = M2SDR_FORMAT_SC16_Q11;
     static unsigned host_buffers = 0;
+    static uint8_t direct = 0;
     double ts_jump_threshold_pct = 5.0;
     struct m2sdr_sigmf_meta sigmf_meta;
     struct m2sdr_sigmf_annotation pending_annotation;
@@ -718,6 +841,7 @@ int main(int argc, char **argv)
         { "annotate-ts-jumps", no_argument, NULL, 16 },
         { "ts-jump-threshold-pct", required_argument, NULL, 17 },
         { "host-buffers", required_argument, NULL, 18 },
+        { "direct", no_argument, NULL, 19 },
         { "format", required_argument, NULL, 1 },
         { "8bit", no_argument, NULL, 2 },
         { NULL, 0, NULL, 0 }
@@ -851,6 +975,9 @@ int main(int argc, char **argv)
                 return 1;
             }
             break;
+        case 19:
+            direct = 1;
+            break;
         default:
             exit(1);
         }
@@ -919,6 +1046,21 @@ int main(int argc, char **argv)
             sigmf_meta.header_bytes = 0;
             sigmf_meta.has_header_bytes = false;
         }
+    }
+
+    if (direct) {
+        if (!filename || strcmp(filename, "-") == 0) {
+            fprintf(stderr, "--direct needs a file path, not stdout\n");
+            return 1;
+        }
+        if (strip_header || host_buffers || annotate_ts_jumps) {
+            fprintf(stderr, "--direct writes whole DMA buffers: no --strip-header, --host-buffers "
+                            "or --annotate-ts-jumps\n");
+            return 1;
+        }
+        m2sdr_record_direct(m2sdr_cli_device_id(&cli_dev), filename, size, quiet, header, format,
+                            sigmf_enable ? true : false, &sigmf_meta);
+        return 0;
     }
 
     m2sdr_record(m2sdr_cli_device_id(&cli_dev), filename, size, quiet, header, strip_header, format,

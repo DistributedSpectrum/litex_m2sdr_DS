@@ -179,6 +179,30 @@ mv capture capture.sigmf-data   # the .sigmf-meta already names it so
 reading taken before the capture. `jetson_clocks` makes no difference in the
 15 W mode (the CPU is already at its 1.42 GHz cap).
 
+#### 16-bit (sc16, 491.5 MB/s): `m2sdr_record --direct`
+
+The default path copies every sample several times (ring -> recorder -> page cache -> disk). In the
+15 W mode that is CPU-bound at sc16, even though the NVMe sustains 1.2 GB/s of direct writes. Over
+30 s at 122.88 MSPS sc16, with a 2048-buffer ring:
+
+| setup | overflow events |
+|---|---|
+| plain `m2sdr_record FILE` | 879 (~1/3 of the data lost) |
+| + the sc8 tuning above | 808 |
+| `m2sdr_record - \| dd bs=8M oflag=direct` | 930 |
+| `m2sdr_record --direct FILE` | **0** (max write 7.4 ms, peak backlog ~730 buffers) |
+
+`--direct` (`m2sdr_rx_stream_to_fd()` in libm2sdr) takes buffers straight from the zero-copy DMA ring
+and writes runs of 256 with O_DIRECT, through a single bounce copy, since O_DIRECT cannot read the
+PFN-mapped ring. It needs no sysctl, `chrt` or `--host-buffers`. A run with `--enable-header` checked
+all 1.8 M buffer timestamps: no gaps or repeats. Its peak backlog is past the old 256-buffer ring's
+128-buffer overflow budget, so build the gateware with `--pcie-dma-table-depth=2048`.
+
+```bash
+m2sdr_rf --channel-layout 1t1r --sample-rate 122.88e6 --rx-freq 735e6 --rx-gain-mode slow --format sc16
+m2sdr_record --direct --format sc16 capture.bin 14745600000   # 30 s
+```
+
 ### Full-Range Sweeps
 
 `scripts/m2sdr_sweep.py` covers 70 MHz-6 GHz at 122.88 MSPS 16-bit in 79

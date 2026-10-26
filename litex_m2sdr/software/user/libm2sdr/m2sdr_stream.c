@@ -11,7 +11,13 @@
 /* Includes */
 /*----------*/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* O_DIRECT (m2sdr_rx_stream_to_fd). */
+#endif
+
 #include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1686,6 +1692,166 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
         meta->flags |= M2SDR_META_FLAG_HAS_TIME;
     }
     return M2SDR_ERR_OK;
+}
+
+static uint64_t m2sdr_monotonic_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* write() all of buf, retrying partial writes and EINTR. An O_DIRECT fd only takes lengths that
+ * are a multiple of the 4 KiB block: an unaligned tail is written after clearing O_DIRECT. */
+static int m2sdr_write_all(int fd, const char *buf, size_t len)
+{
+    const size_t block = 4096;
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags >= 0 && (flags & O_DIRECT) && (len % block)) {
+        size_t head = len - (len % block);
+
+        if (head && m2sdr_write_all(fd, buf, head) != 0)
+            return -1;
+        if (fcntl(fd, F_SETFL, flags & ~O_DIRECT) != 0)
+            return -1;
+        return m2sdr_write_all(fd, buf + head, len - head);
+    }
+    while (len) {
+        ssize_t n = write(fd, buf, len);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+int m2sdr_rx_stream_to_fd(struct m2sdr_dev *dev,
+                          const struct m2sdr_rx_to_fd_params *params,
+                          struct m2sdr_rx_to_fd_stats *stats)
+{
+    struct m2sdr_rx_to_fd_stats local;
+
+    if (!stats)
+        stats = &local;
+    memset(stats, 0, sizeof(*stats));
+    if (!dev || !params || params->fd < 0)
+        return M2SDR_ERR_INVAL;
+    if (dev->transport != M2SDR_TRANSPORT_LITEPCIE || !dev->zero_copy)
+        return M2SDR_ERR_UNSUPPORTED;
+
+    struct litepcie_dma_ctrl *dma = &dev->rx_dma;
+    const int64_t count = dma->mmap_dma_info.dma_rx_buf_count;
+    const int64_t bsize = dma->mmap_dma_info.dma_rx_buf_size;
+    if (count < 2 || bsize <= 0 || !dma->buf_rd)
+        return M2SDR_ERR_STATE;
+
+    /* Release at most half a ring late: the overflow budget (count / 2) must outlast a chunk. */
+    int64_t chunk = params->chunk_buffers ? params->chunk_buffers : 256;
+    if (chunk > count / 2)
+        chunk = count / 2;
+
+    /* O_DIRECT has to pin the source pages, which the driver's PFN-mapped ring does not allow
+     * (the write fails), so an O_DIRECT fd gets each run through one aligned bounce copy. */
+    char *bounce = NULL;
+    int fd_flags = fcntl(params->fd, F_GETFL);
+    if (fd_flags >= 0 && (fd_flags & O_DIRECT)) {
+        if (posix_memalign((void **)&bounce, 4096, (size_t)(chunk * bsize)) != 0)
+            return M2SDR_ERR_NO_MEM;
+    }
+    int ret = M2SDR_ERR_OK;
+
+    uint64_t remaining   = params->max_bytes;
+    uint64_t last_report = m2sdr_monotonic_us();
+
+    while (!(params->keep_running && !*params->keep_running)) {
+        litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
+                            &dma->writer_hw_count, &dma->writer_sw_count);
+        int64_t writer = dma->writer_hw_count;
+        int64_t level  = writer - dev->rx_release_count;
+
+        if (level > (int64_t)stats->ring_high_water)
+            stats->ring_high_water = (uint64_t)level;
+        if (level > count / 2) {
+            /* Overrun: skip to the live writer, as m2sdr_get_buffer() does. */
+            stats->overflow_events++;
+            stats->overflow_buffers += (uint64_t)level;
+            dev->pcie_rx_overflow_events++;
+            dev->pcie_rx_overflow_buffers += (uint64_t)level;
+            dev->rx_user_count    = writer;
+            dev->rx_release_count = writer;
+            m2sdr_pcie_dma_update_rx_release(dev);
+            continue;
+        }
+
+        int64_t avail = writer - dev->rx_user_count;
+        bool    last  = remaining && remaining <= (uint64_t)(avail * bsize);
+        if (avail < chunk && !last) {
+            /* Let a chunk accumulate (~4 ms at 122.88 MSPS sc16 with 256 x 8 KiB). */
+            struct timespec nap = { 0, 500000 };
+            nanosleep(&nap, NULL);
+            continue;
+        }
+
+        int64_t slot = dev->rx_user_count % count;
+        int64_t run  = avail < chunk ? avail : chunk;
+        if (run > count - slot)
+            run = count - slot;
+        uint64_t bytes = (uint64_t)(run * bsize);
+        if (remaining && bytes > remaining) {
+            bytes = remaining;
+            run   = (int64_t)((bytes + (uint64_t)bsize - 1) / (uint64_t)bsize);
+        }
+
+        uint64_t t0 = m2sdr_monotonic_us();
+        const char *src = dma->buf_rd + slot * bsize;
+        if (bounce) {
+            memcpy(bounce, src, (size_t)bytes);
+            src = bounce;
+        }
+        if (m2sdr_write_all(params->fd, src, (size_t)bytes) != 0) {
+            ret = M2SDR_ERR_IO;
+            break;
+        }
+        uint64_t dt = m2sdr_monotonic_us() - t0;
+        if (dt > stats->max_write_us)
+            stats->max_write_us = dt;
+
+        /* The DMA loops without back-pressure: if it reached these slots again during the
+         * write, part of what was written may be newer data. */
+        litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
+                            &dma->writer_hw_count, &dma->writer_sw_count);
+        if (dma->writer_hw_count - dev->rx_user_count >= count)
+            stats->torn_writes++;
+
+        dev->rx_user_count    += run;
+        dev->rx_release_count += run;
+        m2sdr_pcie_dma_update_rx_release(dev);
+
+        stats->bytes   += bytes;
+        stats->buffers += (uint64_t)run;
+        stats->writes++;
+
+        if (remaining) {
+            remaining -= bytes;
+            if (!remaining)
+                break;
+        }
+        if (params->progress && m2sdr_monotonic_us() - last_report >= 1000000u) {
+            params->progress(stats, params->user);
+            last_report = m2sdr_monotonic_us();
+        }
+    }
+    if (params->progress)
+        params->progress(stats, params->user);
+    free(bounce);
+    return ret;
 }
 
 /* Live DMA cursor as a MONOTONIC absolute buffer count (LitePCIe).
