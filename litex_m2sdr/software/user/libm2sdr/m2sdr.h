@@ -1033,12 +1033,13 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
 
 /* RX DMA ring -> file descriptor, with no copy (LitePCIe zero-copy RX streams).
  *
- * Writes runs of consecutive DMA ring buffers (up to chunk_buffers, never across the ring wrap)
- * with one write() each, and releases them only once written. A plain fd is written straight
- * from the mmap'd ring (no copy, through the page cache). An O_DIRECT fd bypasses the page
- * cache; O_DIRECT cannot take its source from the driver's PFN-mapped ring, so each run is
- * copied once into an aligned bounce buffer first. A final partial buffer (max_bytes not a
- * multiple of 4096) is written with O_DIRECT cleared. Headers, if enabled, stay in the data.
+ * Copies runs of consecutive DMA ring buffers (up to chunk_buffers, never across the ring wrap)
+ * into a page-aligned RAM queue (queue_bytes) and releases them at once; a writer thread writes
+ * each queued run to the fd with one write(). A slow write (an SSD's housekeeping stalls) then
+ * fills the queue instead of overrunning the DMA ring. The queue copy is the only one: the fd
+ * can be opened with O_DIRECT to bypass the page cache (O_DIRECT cannot read the driver's
+ * PFN-mapped ring itself). A final partial buffer (max_bytes not a multiple of 4096) is written
+ * with O_DIRECT cleared. Headers, if enabled, stay in the data.
  *
  * Requires a stream configured with m2sdr_sync_config_ex() and zero_copy set. Runs until
  * max_bytes are written (0: no limit), *keep_running reads 0, or a write fails. Overruns
@@ -1053,6 +1054,7 @@ struct m2sdr_rx_to_fd_stats {
     uint64_t torn_writes;       /* Writes the DMA may have overwritten (lapped) while writing. */
     uint64_t ring_high_water;   /* Deepest backlog, in buffers.                               */
     uint64_t max_write_us;      /* Slowest single write().                                     */
+    uint64_t queue_high_water;  /* Most RAM queue bytes waiting for the disk.                 */
 };
 
 struct m2sdr_rx_to_fd_params {
@@ -1062,6 +1064,7 @@ struct m2sdr_rx_to_fd_params {
     const volatile int *keep_running; /* Optional: stop once it reads 0.                       */
     void (*progress)(const struct m2sdr_rx_to_fd_stats *stats, void *user); /* Optional, ~1 Hz. */
     void *user;
+    size_t queue_bytes;             /* RAM queue between ring and disk (0: 256 MiB).         */
 };
 
 int m2sdr_rx_stream_to_fd(struct m2sdr_dev *dev,

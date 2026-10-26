@@ -489,10 +489,10 @@ static void m2sdr_record_direct(const char *device_id, const char *filename, siz
     if (!quiet)
         fprintf(stderr, "Direct RX: bytes=%" PRIu64 " buffers=%" PRIu64 " writes=%" PRIu64
                 " max_write=%.1fms high_water=%" PRIu64 " overflows=%" PRIu64
-                " overflow_buffers=%" PRIu64 " torn_writes=%" PRIu64 "\n",
+                " overflow_buffers=%" PRIu64 " torn_writes=%" PRIu64 " queue_high_water=%.0fMB\n",
                 stats.bytes, stats.buffers, stats.writes, stats.max_write_us / 1000.0,
                 stats.ring_high_water, stats.overflow_events, stats.overflow_buffers,
-                stats.torn_writes);
+                stats.torn_writes, stats.queue_high_water / 1048576.0);
 
     if (sigmf_enable) {
         char data_path[1024] = {0};

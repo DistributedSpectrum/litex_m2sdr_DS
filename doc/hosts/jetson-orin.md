@@ -192,9 +192,12 @@ The default path copies every sample several times (ring -> recorder -> page cac
 | `m2sdr_record - \| dd bs=8M oflag=direct` | 930 |
 | `m2sdr_record --direct FILE` | **0** (max write 7.4 ms, peak backlog ~730 buffers) |
 
-`--direct` (`m2sdr_rx_stream_to_fd()` in libm2sdr) takes buffers straight from the zero-copy DMA ring
-and writes runs of 256 with O_DIRECT, through a single bounce copy, since O_DIRECT cannot read the
-PFN-mapped ring. It needs no sysctl, `chrt` or `--host-buffers`. A run with `--enable-header` checked
+`--direct` (`m2sdr_rx_stream_to_fd()` in libm2sdr) takes buffers straight from the zero-copy DMA ring,
+copies runs of 256 into a 256 MiB RAM queue (the one copy; O_DIRECT cannot read the PFN-mapped ring)
+and a writer thread writes them with O_DIRECT. Disk stalls fill the queue instead of the DMA ring:
+on a KingSpec XG7000 1 TB (MAXIO MAP1602, Gen4 x1 through the E-key slot), 100 GB had 89 overflows
+before the queue (write stalls up to 38 ms) and 0 with it (stalls up to 36.5 ms, queue peak 18 MB).
+The original PNY CS2142 cannot sustain the rate past its ~38 GB write cache (~85 MB/s after). It needs no sysctl, `chrt` or `--host-buffers`. A run with `--enable-header` checked
 all 1.8 M buffer timestamps: no gaps or repeats. Its peak backlog is past the old 256-buffer ring's
 128-buffer overflow budget, so build the gateware with `--pcie-dma-table-depth=2048`.
 

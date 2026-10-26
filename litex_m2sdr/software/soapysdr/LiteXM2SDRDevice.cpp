@@ -2868,12 +2868,12 @@ std::string SoapyLiteXM2SDR::readSetting(const std::string &key) const {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
             "running=%d bytes=%llu buffers=%llu overflows=%llu overflow_buffers=%llu "
-            "torn_writes=%llu high_water=%llu max_write_ms=%.1f result=%s",
+            "torn_writes=%llu high_water=%llu max_write_ms=%.1f queue_high_water_mb=%.0f result=%s",
             _rx_record.running.load() ? 1 : 0,
             (unsigned long long)st.bytes, (unsigned long long)st.buffers,
             (unsigned long long)st.overflow_events, (unsigned long long)st.overflow_buffers,
             (unsigned long long)st.torn_writes, (unsigned long long)st.ring_high_water,
-            st.max_write_us / 1000.0, m2sdr_strerror(_rx_record.result));
+            st.max_write_us / 1000.0, st.queue_high_water / 1048576.0, m2sdr_strerror(_rx_record.result));
         return buf;
     }
     return SoapySDR::Device::readSetting(key);
