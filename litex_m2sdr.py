@@ -1583,6 +1583,61 @@ class BaseSoC(SoCMini):
             csr_csv      = "test/analyzer.csv"
         )
 
+    def add_pcie_dma_reader_probe(self, depth=8192):
+        # DMA Reader host reads, seen at the endpoint boundary (the crossbar's TLP controller only
+        # exists after finalize): tagged requests to the host, completions from the host, and the
+        # number of reads still waiting for their final completion.
+        assert hasattr(self, "pcie_dma0")
+        endpoint = self.pcie_endpoint
+        req_out  = endpoint.packetizer.req_sink    # Tagged requests to the host.
+        cmp_in   = endpoint.depacketizer.cmp_source
+        phy_rx   = self.pcie_phy.source
+        self.pcie_reads_pending = reads_pending = Signal(8)
+        read_issued = Signal()
+        read_done   = Signal()
+        self.comb += [
+            read_issued.eq(req_out.valid & req_out.ready & req_out.first & ~req_out.we),
+            read_done.eq(cmp_in.valid & cmp_in.ready & cmp_in.last & (cmp_in.end | cmp_in.err)),
+        ]
+        self.sync += reads_pending.eq(reads_pending + read_issued - read_done)
+        req_adr       = Signal(32)
+        cmp_adr       = Signal(12)
+        reader_enable = Signal()
+        self.comb += [
+            req_adr.eq(req_out.adr),
+            cmp_adr.eq(cmp_in.adr),
+            reader_enable.eq(self.pcie_dma0.reader.enable),
+        ]
+        analyzer_signals = [
+            # Raw TLPs from the PHY (first beat holds the header).
+            phy_rx.valid, phy_rx.ready, phy_rx.first, phy_rx.last, phy_rx.dat,
+
+            # Read requests to the host.
+            req_out.valid, req_out.ready, req_out.first, req_out.last,
+            req_out.we, req_out.tag, req_out.len, req_adr,
+
+            # Completions from the depacketizer.
+            cmp_in.valid, cmp_in.ready, cmp_in.first, cmp_in.last,
+            cmp_in.tag, cmp_in.len, cmp_in.byte_count, cmp_in.end, cmp_in.err,
+            cmp_in.req_id, cmp_in.cmp_id, cmp_adr,
+
+            # Reads waiting for their final completion.
+            reads_pending,
+
+            # MMIO requests (to see whether host register accesses still get through).
+            endpoint.depacketizer.req_source.valid, endpoint.depacketizer.req_source.ready,
+
+            # DMA Reader.
+            reader_enable,
+            self.pcie_dma0.source.valid, self.pcie_dma0.source.ready,
+        ]
+        self.analyzer = LiteScopeAnalyzer(analyzer_signals,
+            depth        = depth,
+            clock_domain = "sys",
+            register     = True,
+            csr_csv      = "test/analyzer.csv"
+        )
+
     # Clocking.
     def add_si5351_i2c_probe(self, depth=4096):
         analyzer_signals = [
@@ -1737,6 +1792,7 @@ def main():
     probeopts = parser.add_mutually_exclusive_group()
     probeopts.add_argument("--with-pcie-probe",        action="store_true", help="Enable PCIe Probe.")
     probeopts.add_argument("--with-pcie-dma-probe",    action="store_true", help="Enable PCIe DMA Probe.")
+    probeopts.add_argument("--with-pcie-dma-reader-probe", action="store_true", help="Enable PCIe DMA Reader (host reads) Probe.")
     probeopts.add_argument("--with-si5351-i2c-probe",  action="store_true", help="Enable SI5351 I2C Probe.")
     probeopts.add_argument("--with-eth-phy-rx-probe",  action="store_true", help="Enable raw Ethernet PHY RX Probe.")
     probeopts.add_argument("--with-eth-tx-probe",      action="store_true", help="Enable Ethernet Tx Probe.")
@@ -1843,6 +1899,8 @@ def main():
         soc.add_pcie_probe()
     if args.with_pcie_dma_probe:
         soc.add_pcie_dma_probe()
+    if args.with_pcie_dma_reader_probe:
+        soc.add_pcie_dma_reader_probe()
     if args.with_si5351_i2c_probe:
         soc.add_si5351_i2c_probe()
     if args.with_eth_phy_rx_probe:
