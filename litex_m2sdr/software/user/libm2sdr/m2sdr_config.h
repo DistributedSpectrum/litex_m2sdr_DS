@@ -494,7 +494,7 @@ M2SDR_CONFIG_DEF M2SDR_CONFIG_UNUSED AD9361_InitParam default_init_param = {
     10000,  //tx_attenuation_mdB *** adi,tx-attenuation-mdB
     0,      //update_tx_gain_in_alert_enable *** adi,update-tx-gain-in-alert-enable
     /* Reference Clock Control */
-    0,      //xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable
+    1,      //xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable
     {8, 5920},  //dcxo_coarse_and_fine_tune[2] *** adi,dcxo-coarse-and-fine-tune
     CLKOUT_DISABLE, //clk_output_mode_select *** adi,clk-output-mode-select
     /* Gain Control */

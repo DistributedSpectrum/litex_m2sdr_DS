@@ -13,6 +13,16 @@ drivers, C API and tools are all open, built on the [LiteX](https://github.com/e
 framework. Pop it in an M.2 slot, connect antennas, and stream or record I/Q in about 5 minutes
 with our tools or any SoapySDR-compatible software.
 
+> [!IMPORTANT]
+> **DistributedSpectrum fork.** Main target: Jetson Orin Nano, Gen2 x4
+> ([validated setup](doc/hosts/jetson-orin.md#validated-setup-jetson-orin-nano-distributedspectrum-fork),
+> [known-good configuration](doc/known-good-configuration.md)). Build gateware with LiteX
+> >= `fd69861c6` and run `scripts/check_verilog_comb_order.py` on the result: LiteX
+> 2026-06-16..07-07 leaves the SI5351 unprogrammed ([Clock Investigation](doc/clock-investigation.md)).
+> Fork tools: [RX/TX quickstart](doc/rx-tx-quickstart.md), `scripts/m2sdr_sweep.py` (70 MHz-6 GHz
+> in ~1-2.5 s), host notes for [Raspberry Pi 5](doc/hosts/raspberry-pi-5.md) and
+> [Odroid M1](doc/hosts/odroid-m1.md).
+
 <div align="center">
   <img src="https://github.com/user-attachments/assets/c3007b14-0c55-4863-89fa-749082692b4f" alt="LiteX M2 SDR annotated" width="100%">
 </div>
