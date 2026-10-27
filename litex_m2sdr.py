@@ -597,12 +597,18 @@ class BaseSoC(SoCMini):
 
             # Core.
             # -----
+            # Descriptor table depth = max host DMA ring depth (buffers); the kernel driver takes
+            # DMA_BUFFER_COUNT from the generated DMA_TABLE_DEPTH (256 when not exported). Only pass
+            # a non-default depth, so default builds keep working with a LiteX without the argument.
+            dma_table_kwargs = {}
+            if pcie_dma_table_depth != 256:
+                if "dma_table_depth" not in inspect.signature(self.add_pcie).parameters:
+                    raise ValueError("--pcie-dma-table-depth needs a LiteX whose add_pcie() takes dma_table_depth.")
+                dma_table_kwargs["dma_table_depth"] = pcie_dma_table_depth
             self.add_pcie(phy=self.pcie_phy, address_width=64, ndmas=pcie_dmas,
                 data_width=128 if with_rfic_oversampling else 64,
                 with_dma_buffering    = True, dma_buffering_depth=8192,
-                # Descriptor table depth = max host DMA ring depth (buffers); the kernel driver
-                # takes DMA_BUFFER_COUNT from the generated DMA_TABLE_DEPTH.
-                dma_table_depth       = pcie_dma_table_depth,
+                **dma_table_kwargs,
                 with_dma_loopback     = True,
                 with_dma_synchronizer = True,
                 with_msi              = True, msis = pcie_msis,
