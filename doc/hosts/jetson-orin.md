@@ -121,6 +121,13 @@ runs from the SI5351 time reference either way.
 | sc8 (1.97 Gbps needed) | 1.97 Gbps, 0 overflows | 1.97 Gbps, 0 overflows |
 | sc16 (3.93 Gbps needed) | capped at ~3.32 Gbps, drops | 3.93 Gbps, 0 overflows |
 
+TX (and the `m2sdr_util dma-test` loopback) on x4 needs LitePCIe with the 128-bit RX byte-enable
+fix (litepcie_DS `s7-128b-rx-eof-keep`). Since LitePCIe f4dbb63 the 7-Series 128-bit path adds a
+junk beat to every read completion; the DMA reader stalls after a few buffers, and stopping it
+then leaves the card unable to answer register reads (the Jetson hangs). x1 (64-bit) builds and RX
+are not affected. Validate TX with `m2sdr_util --zero-copy dma-test`: the copy mode cannot keep
+up at ~7 Gbps on the Orin Nano and reports underflows as data errors.
+
 The x4 build changes the generated kernel headers (no PTM CSRs), so rebuild and
 reinstall `m2sdr.ko`, the user tools and the SoapySDR module after switching.
 `make install` of the SoapySDR module writes `/usr/local/lib/SoapySDR/...`, but
