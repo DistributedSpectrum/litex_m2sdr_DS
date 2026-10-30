@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <thread>
 
 #include "m2sdr.h"
 
@@ -378,6 +379,8 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     ***********************************************************************************************/
     SoapySDR::ArgInfoList getSettingInfo(void) const override;
 
+    SoapySDR::ArgInfoList getStreamArgsInfo(const int direction, const size_t channel) const override;
+
     void writeSetting(const std::string &key, const std::string &value) override;
 
     std::string readSetting(const std::string &key) const override;
@@ -570,6 +573,29 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     std::recursive_mutex &streamAccessMutex(SoapySDR::Stream *stream) const;
     void resetDatapathUnlocked();
     void stopRxStreamUnlocked();
+
+    /* RX record-to-disk (RX stream arg "record"): while the stream is active, a background
+     * thread writes the DMA ring straight to the file with m2sdr_rx_stream_to_fd(); readStream()
+     * is not available on such a stream. */
+    struct RxRecord {
+        std::string path;                 /* Empty: normal streaming.                    */
+        uint64_t max_bytes = 0;           /* 0: until deactivateStream().                */
+        unsigned chunk_buffers = 0;       /* 0: library default.                         */
+        bool header = false;              /* Keep the 16-byte DMA headers in the file.   */
+        bool direct = true;               /* O_DIRECT (bypass the page cache).            */
+        bool fstrim = true;               /* fstrim the filesystem once the capture stops. */
+        int fd = -1;
+        volatile int keep_running = 0;
+        std::thread thread;
+        std::atomic<bool> running{false};
+        mutable std::mutex stats_mutex;   /* Guards stats and result.                    */
+        struct m2sdr_rx_to_fd_stats stats{};
+        int result = 0;
+    };
+    RxRecord _rx_record;
+    bool startRxRecordUnlocked();
+    void stopRxRecordUnlocked();
+    static void rxRecordProgress(const struct m2sdr_rx_to_fd_stats *stats, void *user);
     void stopTxStreamUnlocked();
     void cleanupLiteEthUdpIfIdleUnlocked();
     void resetTimedTxTimeline();

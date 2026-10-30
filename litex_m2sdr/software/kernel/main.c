@@ -263,7 +263,8 @@ static unsigned int dma_buffer_per_irq[DMA_CHANNEL_COUNT] = {
 static int dma_buffer_size_argc;
 static int dma_buffer_per_irq_argc;
 module_param(dma_buffer_count, int, 0444);
-MODULE_PARM_DESC(dma_buffer_count, "Active DMA ring depth: power of two, 2..256 (default 256). Lower (e.g. 8) for low-latency timed TX.");
+MODULE_PARM_DESC(dma_buffer_count, "Active DMA ring depth: power of two, 2..DMA_BUFFER_COUNT (default DMA_BUFFER_COUNT = "
+	__stringify(DMA_BUFFER_COUNT) ", the gateware DMA table depth). Lower (e.g. 8) for low-latency timed TX.");
 module_param_array(dma_buffer_size, uint, &dma_buffer_size_argc, 0444);
 MODULE_PARM_DESC(dma_buffer_size,
 	"Per-DMA-channel buffer size in bytes, comma separated (default "

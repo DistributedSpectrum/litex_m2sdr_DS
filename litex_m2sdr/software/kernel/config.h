@@ -68,7 +68,13 @@
  * depth. Smaller dma_buffer_per_irq refreshes the host's reader/writer-position view more finely
  * (finer timed-TX pacing) at the cost of a higher interrupt rate. */
 #define DMA_BUFFER_PER_IRQ     8
+/* The ring cannot be deeper than the FPGA DMA descriptor table: take it from the gateware
+ * (--pcie-dma-table-depth, exported as DMA_TABLE_DEPTH in soc.h) when the build provides it. */
+#ifdef DMA_TABLE_DEPTH
+#define DMA_BUFFER_COUNT       DMA_TABLE_DEPTH
+#else
 #define DMA_BUFFER_COUNT       256
+#endif
 #define DMA_BUFFER_SIZE        8192
 #define DMA_BUFFER_TOTAL_SIZE (DMA_BUFFER_COUNT*DMA_BUFFER_SIZE)
 //#define DMA_BUFFER_ALIGNED

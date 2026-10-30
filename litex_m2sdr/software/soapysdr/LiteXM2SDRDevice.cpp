@@ -2794,6 +2794,43 @@ SoapySDR::ArgInfoList SoapyLiteXM2SDR::getSettingInfo(void) const {
         "retrimming the SI5351 PLL at runtime without a PLL reset." + window;
     infos.push_back(info);
 #endif
+    SoapySDR::ArgInfo record;
+    record.key         = "rx_record_status";
+    record.name        = "RX record status";
+    record.type        = SoapySDR::ArgInfo::STRING;
+    record.description = "Read-only: progress of an RX stream in record mode (stream arg \"record\"): "
+                         "running, bytes, buffers, overflows, overflow_buffers, torn_writes, high_water, "
+                         "max_write_ms, result.";
+    infos.push_back(record);
+    return infos;
+}
+
+SoapySDR::ArgInfoList SoapyLiteXM2SDR::getStreamArgsInfo(const int direction, const size_t /*channel*/) const {
+    SoapySDR::ArgInfoList infos;
+    if (direction != SOAPY_SDR_RX || !isLitePCIe())
+        return infos;
+
+    auto add = [&](const char *key, const char *value, const char *name,
+                   SoapySDR::ArgInfo::Type type, const char *description) {
+        SoapySDR::ArgInfo info;
+        info.key = key; info.value = value; info.name = name; info.type = type;
+        info.description = description;
+        infos.push_back(info);
+    };
+    add("record", "", "Record to file", SoapySDR::ArgInfo::STRING,
+        "Record mode: while the stream is active, write the DMA ring straight to this file "
+        "(native CS16/CS8 samples, no copy through readStream; readStream() is not available).");
+    add("record_bytes", "0", "Record byte limit", SoapySDR::ArgInfo::INT,
+        "Stop recording after this many bytes (0: until deactivateStream()).");
+    add("record_header", "0", "Keep DMA headers", SoapySDR::ArgInfo::BOOL,
+        "Keep the 16-byte DMA header (sync word + ns timestamp) at the start of every 8 KiB buffer.");
+    add("record_direct", "1", "O_DIRECT", SoapySDR::ArgInfo::BOOL,
+        "Write with O_DIRECT, bypassing the page cache (recommended for full-rate recording).");
+    add("record_chunk", "0", "Buffers per write", SoapySDR::ArgInfo::INT,
+        "DMA buffers per write() (0: 256; at most half the ring).");
+    add("record_fstrim", "1", "fstrim after capture", SoapySDR::ArgInfo::BOOL,
+        "Trim the file's filesystem when the capture stops, so the SSD can rebuild its write cache "
+        "for the next one (needs root, or a NOPASSWD sudoers rule for fstrim).");
     return infos;
 }
 
@@ -2825,5 +2862,19 @@ void SoapyLiteXM2SDR::writeSetting(const std::string &key, const std::string &va
 std::string SoapyLiteXM2SDR::readSetting(const std::string &key) const {
     if (key == "refclk_ppm")
         return std::to_string(_refclk_ppm);
+    if (key == "rx_record_status") {
+        std::lock_guard<std::mutex> lock(_rx_record.stats_mutex);
+        const struct m2sdr_rx_to_fd_stats &st = _rx_record.stats;
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            "running=%d bytes=%llu buffers=%llu overflows=%llu overflow_buffers=%llu "
+            "torn_writes=%llu high_water=%llu max_write_ms=%.1f queue_high_water_mb=%.0f result=%s",
+            _rx_record.running.load() ? 1 : 0,
+            (unsigned long long)st.bytes, (unsigned long long)st.buffers,
+            (unsigned long long)st.overflow_events, (unsigned long long)st.overflow_buffers,
+            (unsigned long long)st.torn_writes, (unsigned long long)st.ring_high_water,
+            st.max_write_us / 1000.0, st.queue_high_water / 1048576.0, m2sdr_strerror(_rx_record.result));
+        return buf;
+    }
     return SoapySDR::Device::readSetting(key);
 }
