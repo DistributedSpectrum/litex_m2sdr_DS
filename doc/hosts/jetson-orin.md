@@ -121,6 +121,13 @@ runs from the SI5351 time reference either way.
 | sc8 (1.97 Gbps needed) | 1.97 Gbps, 0 overflows | 1.97 Gbps, 0 overflows |
 | sc16 (3.93 Gbps needed) | capped at ~3.32 Gbps, drops | 3.93 Gbps, 0 overflows |
 
+TX (and the `m2sdr_util dma-test` loopback) on x4 needs LitePCIe with the 128-bit RX byte-enable
+fix (litepcie_DS `s7-128b-rx-eof-keep`). Since LitePCIe f4dbb63 the 7-Series 128-bit path adds a
+junk beat to every read completion; the DMA reader stalls after a few buffers, and stopping it
+then leaves the card unable to answer register reads (the Jetson hangs). x1 (64-bit) builds and RX
+are not affected. Validate TX with `m2sdr_util --zero-copy dma-test`: the copy mode cannot keep
+up at ~7 Gbps on the Orin Nano and reports underflows as data errors.
+
 The x4 build changes the generated kernel headers (no PTM CSRs), so rebuild and
 reinstall `m2sdr.ko`, the user tools and the SoapySDR module after switching.
 `make install` of the SoapySDR module writes `/usr/local/lib/SoapySDR/...`, but
@@ -178,6 +185,36 @@ mv capture capture.sigmf-data   # the .sigmf-meta already names it so
 `m2sdr_record`'s overflow counters are cumulative since boot; compare against a
 reading taken before the capture. `jetson_clocks` makes no difference in the
 15 W mode (the CPU is already at its 1.42 GHz cap).
+
+#### 16-bit (sc16, 491.5 MB/s): `m2sdr_record --direct`
+
+The default path copies every sample several times (ring -> recorder -> page cache -> disk). In the
+15 W mode that is CPU-bound at sc16, even though the NVMe sustains 1.2 GB/s of direct writes. Over
+30 s at 122.88 MSPS sc16, with a 2048-buffer ring:
+
+| setup | overflow events |
+|---|---|
+| plain `m2sdr_record FILE` | 879 (~1/3 of the data lost) |
+| + the sc8 tuning above | 808 |
+| `m2sdr_record - \| dd bs=8M oflag=direct` | 930 |
+| `m2sdr_record --direct FILE` | **0** (max write 7.4 ms, peak backlog ~730 buffers) |
+
+`--direct` (`m2sdr_rx_stream_to_fd()` in libm2sdr) takes buffers straight from the zero-copy DMA ring,
+copies runs of 256 into a 256 MiB RAM queue (the one copy; O_DIRECT cannot read the PFN-mapped ring)
+and a writer thread writes them with O_DIRECT. Disk stalls fill the queue instead of the DMA ring:
+on a KingSpec XG7000 1 TB (MAXIO MAP1602, Gen4 x1 through the E-key slot), 100 GB had 89 overflows
+before the queue (write stalls up to 38 ms) and 0 with it (stalls up to 36.5 ms, queue peak 18 MB).
+A 350 GiB fio run on the same drive (2 MiB O_DIRECT writes, one at a time) averaged 963 MB/s with no
+write-cache cliff and never fell below 690 MB/s in any second, but single writes stalled for up to
+141 ms (p99.99 95 ms): more than the DMA ring can hold, well within the queue.
+The original PNY CS2142 cannot sustain the rate past its ~38 GB write cache (~85 MB/s after). It needs no sysctl, `chrt` or `--host-buffers`. A run with `--enable-header` checked
+all 1.8 M buffer timestamps: no gaps or repeats. Its peak backlog is past the old 256-buffer ring's
+128-buffer overflow budget, so build the gateware with `--pcie-dma-table-depth=2048`.
+
+```bash
+m2sdr_rf --channel-layout 1t1r --sample-rate 122.88e6 --rx-freq 735e6 --rx-gain-mode slow --format sc16
+m2sdr_record --direct --format sc16 capture.bin 14745600000   # 30 s
+```
 
 ### Full-Range Sweeps
 

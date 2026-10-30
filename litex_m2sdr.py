@@ -322,7 +322,7 @@ class BaseSoC(SoCMini):
     }
 
     def __init__(self, variant="m2", sys_clk_freq=int(125e6),
-        with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1, pcie_dmas=1, with_pcie_reset_workaround=False,
+        with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1, pcie_dmas=1, pcie_dma_table_depth=256, with_pcie_reset_workaround=False,
         with_eth               = False, eth_sfp=0, eth_phy="1000basex", eth_local_ip="192.168.1.50", eth_udp_port=2345,
         with_eth_ptp           = False, eth_ptp_p2p=False, eth_ptp_igmp=True, eth_ptp_igmp_interval=2,
         with_eth_ptp_rfic_clock = False,
@@ -343,6 +343,10 @@ class BaseSoC(SoCMini):
 
         if with_pcie_ptm and not with_pcie:
             raise ValueError("PCIe PTM requires PCIe to be enabled")
+
+        # The kernel driver's DMA ring depth (DMA_BUFFER_COUNT) must be a power of two.
+        if not (2 <= pcie_dma_table_depth <= 65536) or (pcie_dma_table_depth & (pcie_dma_table_depth - 1)):
+            raise ValueError("PCIe DMA table depth must be a power of two in 2..65536.")
 
         # Platform ---------------------------------------------------------------------------------
 
@@ -594,9 +598,18 @@ class BaseSoC(SoCMini):
 
             # Core.
             # -----
+            # Descriptor table depth = max host DMA ring depth (buffers); the kernel driver takes
+            # DMA_BUFFER_COUNT from the generated DMA_TABLE_DEPTH (256 when not exported). Only pass
+            # a non-default depth, so default builds keep working with a LiteX without the argument.
+            dma_table_kwargs = {}
+            if pcie_dma_table_depth != 256:
+                if "dma_table_depth" not in inspect.signature(self.add_pcie).parameters:
+                    raise ValueError("--pcie-dma-table-depth needs a LiteX whose add_pcie() takes dma_table_depth.")
+                dma_table_kwargs["dma_table_depth"] = pcie_dma_table_depth
             self.add_pcie(phy=self.pcie_phy, address_width=64, ndmas=pcie_dmas,
                 data_width=128 if with_rfic_oversampling else 64,
                 with_dma_buffering    = True, dma_buffering_depth=8192,
+                **dma_table_kwargs,
                 with_dma_loopback     = True,
                 with_dma_synchronizer = True,
                 with_msi              = True, msis = pcie_msis,
@@ -1586,6 +1599,61 @@ class BaseSoC(SoCMini):
             csr_csv      = "test/analyzer.csv"
         )
 
+    def add_pcie_dma_reader_probe(self, depth=8192):
+        # DMA Reader host reads, seen at the endpoint boundary (the crossbar's TLP controller only
+        # exists after finalize): tagged requests to the host, completions from the host, and the
+        # number of reads still waiting for their final completion.
+        assert hasattr(self, "pcie_dma0")
+        endpoint = self.pcie_endpoint
+        req_out  = endpoint.packetizer.req_sink    # Tagged requests to the host.
+        cmp_in   = endpoint.depacketizer.cmp_source
+        phy_rx   = self.pcie_phy.source
+        self.pcie_reads_pending = reads_pending = Signal(8)
+        read_issued = Signal()
+        read_done   = Signal()
+        self.comb += [
+            read_issued.eq(req_out.valid & req_out.ready & req_out.first & ~req_out.we),
+            read_done.eq(cmp_in.valid & cmp_in.ready & cmp_in.last & (cmp_in.end | cmp_in.err)),
+        ]
+        self.sync += reads_pending.eq(reads_pending + read_issued - read_done)
+        req_adr       = Signal(32)
+        cmp_adr       = Signal(12)
+        reader_enable = Signal()
+        self.comb += [
+            req_adr.eq(req_out.adr),
+            cmp_adr.eq(cmp_in.adr),
+            reader_enable.eq(self.pcie_dma0.reader.enable),
+        ]
+        analyzer_signals = [
+            # Raw TLPs from the PHY (first beat holds the header).
+            phy_rx.valid, phy_rx.ready, phy_rx.first, phy_rx.last, phy_rx.dat,
+
+            # Read requests to the host.
+            req_out.valid, req_out.ready, req_out.first, req_out.last,
+            req_out.we, req_out.tag, req_out.len, req_adr,
+
+            # Completions from the depacketizer.
+            cmp_in.valid, cmp_in.ready, cmp_in.first, cmp_in.last,
+            cmp_in.tag, cmp_in.len, cmp_in.byte_count, cmp_in.end, cmp_in.err,
+            cmp_in.req_id, cmp_in.cmp_id, cmp_adr,
+
+            # Reads waiting for their final completion.
+            reads_pending,
+
+            # MMIO requests (to see whether host register accesses still get through).
+            endpoint.depacketizer.req_source.valid, endpoint.depacketizer.req_source.ready,
+
+            # DMA Reader.
+            reader_enable,
+            self.pcie_dma0.source.valid, self.pcie_dma0.source.ready,
+        ]
+        self.analyzer = LiteScopeAnalyzer(analyzer_signals,
+            depth        = depth,
+            clock_domain = "sys",
+            register     = True,
+            csr_csv      = "test/analyzer.csv"
+        )
+
     # Clocking.
     def add_si5351_i2c_probe(self, depth=4096):
         analyzer_signals = [
@@ -1694,6 +1762,7 @@ def main():
     parser.add_argument("--pcie-gen",        default=2, type=int, help="PCIe Generation.", choices=[1, 2])
     parser.add_argument("--pcie-lanes",      default=1, type=int, help="PCIe Lanes.", choices=[1, 2, 4])
     parser.add_argument("--pcie-dmas",       default=1, type=int, help="Number of PCIe DMA channels (subclasses may use >1 for side-band streams).")
+    parser.add_argument("--pcie-dma-table-depth", default=256, type=int, help="PCIe DMA descriptor table depth = max host DMA ring depth in buffers (power of two).")
 
     # Ethernet parameters.
     parser.add_argument("--with-eth",        action="store_true",     help="Enable Ethernet Communication.")
@@ -1739,6 +1808,7 @@ def main():
     probeopts = parser.add_mutually_exclusive_group()
     probeopts.add_argument("--with-pcie-probe",        action="store_true", help="Enable PCIe Probe.")
     probeopts.add_argument("--with-pcie-dma-probe",    action="store_true", help="Enable PCIe DMA Probe.")
+    probeopts.add_argument("--with-pcie-dma-reader-probe", action="store_true", help="Enable PCIe DMA Reader (host reads) Probe.")
     probeopts.add_argument("--with-si5351-i2c-probe",  action="store_true", help="Enable SI5351 I2C Probe.")
     probeopts.add_argument("--with-eth-phy-rx-probe",  action="store_true", help="Enable raw Ethernet PHY RX Probe.")
     probeopts.add_argument("--with-eth-tx-probe",      action="store_true", help="Enable Ethernet Tx Probe.")
@@ -1799,6 +1869,7 @@ def main():
         pcie_gen      = args.pcie_gen,
         pcie_lanes    = args.pcie_lanes,
         pcie_dmas     = args.pcie_dmas,
+        pcie_dma_table_depth = args.pcie_dma_table_depth,
 
         # Ethernet.
         with_eth      = args.with_eth,
@@ -1844,6 +1915,8 @@ def main():
         soc.add_pcie_probe()
     if args.with_pcie_dma_probe:
         soc.add_pcie_dma_probe()
+    if args.with_pcie_dma_reader_probe:
+        soc.add_pcie_dma_reader_probe()
     if args.with_si5351_i2c_probe:
         soc.add_si5351_i2c_probe()
     if args.with_eth_phy_rx_probe:

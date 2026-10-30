@@ -11,7 +11,13 @@
 /* Includes */
 /*----------*/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* O_DIRECT (m2sdr_rx_stream_to_fd). */
+#endif
+
 #include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1686,6 +1692,266 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
         meta->flags |= M2SDR_META_FLAG_HAS_TIME;
     }
     return M2SDR_ERR_OK;
+}
+
+static uint64_t m2sdr_monotonic_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* write() all of buf, retrying partial writes and EINTR. An O_DIRECT fd only takes lengths that
+ * are a multiple of the 4 KiB block: an unaligned tail is written after clearing O_DIRECT. */
+static int m2sdr_write_all(int fd, const char *buf, size_t len)
+{
+    const size_t block = 4096;
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags >= 0 && (flags & O_DIRECT) && (len % block)) {
+        size_t head = len - (len % block);
+
+        if (head && m2sdr_write_all(fd, buf, head) != 0)
+            return -1;
+        if (fcntl(fd, F_SETFL, flags & ~O_DIRECT) != 0)
+            return -1;
+        return m2sdr_write_all(fd, buf + head, len - head);
+    }
+    while (len) {
+        ssize_t n = write(fd, buf, len);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* RAM queue between the DMA ring (reader: the calling thread) and the fd (writer thread), so a
+ * slow write fills the queue instead of stalling the release of DMA ring buffers. */
+struct m2sdr_rx_fd_queue {
+    char *mem;                          /* slots x slot_bytes, page aligned (O_DIRECT).        */
+    size_t slot_bytes;
+    unsigned slots;
+    size_t *len;                        /* Bytes held by each slot.                            */
+    unsigned head, tail, used;          /* head: next to fill; tail: next to write.            */
+    bool done;                          /* Reader finished: drain the queue and exit.          */
+    int error;                          /* Writer failure (M2SDR_ERR_*).                        */
+    int fd;
+    struct m2sdr_rx_to_fd_stats *stats; /* Shared with the reader, under lock.                 */
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+};
+
+static void *m2sdr_rx_fd_writer(void *arg)
+{
+    struct m2sdr_rx_fd_queue *q = arg;
+
+    pthread_mutex_lock(&q->lock);
+    for (;;) {
+        while (!q->used && !q->done)
+            pthread_cond_wait(&q->cond, &q->lock);
+        if (!q->used)
+            break; /* Done and drained. */
+        unsigned slot = q->tail;
+        size_t   len  = q->len[slot];
+        pthread_mutex_unlock(&q->lock);
+
+        uint64_t t0 = m2sdr_monotonic_us();
+        int rc = m2sdr_write_all(q->fd, q->mem + (size_t)slot * q->slot_bytes, len);
+        uint64_t dt = m2sdr_monotonic_us() - t0;
+
+        pthread_mutex_lock(&q->lock);
+        if (rc != 0) {
+            q->error = M2SDR_ERR_IO;
+            break;
+        }
+        q->stats->bytes += len;
+        q->stats->writes++;
+        if (dt > q->stats->max_write_us)
+            q->stats->max_write_us = dt;
+        q->tail = (q->tail + 1) % q->slots;
+        q->used--;
+        pthread_cond_broadcast(&q->cond);
+    }
+    pthread_mutex_unlock(&q->lock);
+    return NULL;
+}
+
+static void m2sdr_rx_fd_report(struct m2sdr_rx_fd_queue *q, const struct m2sdr_rx_to_fd_params *params)
+{
+    struct m2sdr_rx_to_fd_stats snapshot;
+
+    pthread_mutex_lock(&q->lock);
+    snapshot = *q->stats;
+    pthread_mutex_unlock(&q->lock);
+    params->progress(&snapshot, params->user);
+}
+
+int m2sdr_rx_stream_to_fd(struct m2sdr_dev *dev,
+                          const struct m2sdr_rx_to_fd_params *params,
+                          struct m2sdr_rx_to_fd_stats *stats)
+{
+    struct m2sdr_rx_to_fd_stats local;
+
+    if (!stats)
+        stats = &local;
+    memset(stats, 0, sizeof(*stats));
+    if (!dev || !params || params->fd < 0)
+        return M2SDR_ERR_INVAL;
+    if (dev->transport != M2SDR_TRANSPORT_LITEPCIE || !dev->zero_copy)
+        return M2SDR_ERR_UNSUPPORTED;
+
+    struct litepcie_dma_ctrl *dma = &dev->rx_dma;
+    const int64_t count = dma->mmap_dma_info.dma_rx_buf_count;
+    const int64_t bsize = dma->mmap_dma_info.dma_rx_buf_size;
+    if (count < 2 || bsize <= 0 || !dma->buf_rd)
+        return M2SDR_ERR_STATE;
+
+    /* Release at most half a ring late: the overflow budget (count / 2) must outlast a chunk. */
+    int64_t chunk = params->chunk_buffers ? params->chunk_buffers : 256;
+    if (chunk > count / 2)
+        chunk = count / 2;
+
+    /* Queue slots are page aligned, so they also serve O_DIRECT, which cannot take its source
+     * from the driver's PFN-mapped ring: the one copy per run goes into the queue. */
+    struct m2sdr_rx_fd_queue q;
+    memset(&q, 0, sizeof(q));
+    q.slot_bytes = (size_t)(chunk * bsize);
+    size_t queue_bytes = params->queue_bytes ? params->queue_bytes : ((size_t)256 << 20);
+    q.slots = (unsigned)(queue_bytes / q.slot_bytes);
+    if (q.slots < 2)
+        q.slots = 2;
+    q.fd    = params->fd;
+    q.stats = stats;
+    if (posix_memalign((void **)&q.mem, 4096, (size_t)q.slots * q.slot_bytes) != 0)
+        return M2SDR_ERR_NO_MEM;
+    q.len = calloc(q.slots, sizeof(*q.len));
+    if (!q.len) {
+        free(q.mem);
+        return M2SDR_ERR_NO_MEM;
+    }
+    pthread_mutex_init(&q.lock, NULL);
+    pthread_cond_init(&q.cond, NULL);
+    pthread_t writer_thread;
+    if (pthread_create(&writer_thread, NULL, m2sdr_rx_fd_writer, &q) != 0) {
+        pthread_cond_destroy(&q.cond);
+        pthread_mutex_destroy(&q.lock);
+        free(q.len);
+        free(q.mem);
+        return M2SDR_ERR_NO_MEM;
+    }
+
+    int ret = M2SDR_ERR_OK;
+    uint64_t remaining   = params->max_bytes;
+    uint64_t last_report = m2sdr_monotonic_us();
+    const struct timespec nap = { 0, 500000 };
+
+    while (!(params->keep_running && !*params->keep_running)) {
+        litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
+                            &dma->writer_hw_count, &dma->writer_sw_count);
+        int64_t writer = dma->writer_hw_count;
+        int64_t level  = writer - dev->rx_release_count;
+
+        pthread_mutex_lock(&q.lock);
+        if (level > (int64_t)stats->ring_high_water)
+            stats->ring_high_water = (uint64_t)level;
+        if (level > count / 2) {
+            /* Overrun: skip to the live writer, as m2sdr_get_buffer() does. */
+            stats->overflow_events++;
+            stats->overflow_buffers += (uint64_t)level;
+            pthread_mutex_unlock(&q.lock);
+            dev->pcie_rx_overflow_events++;
+            dev->pcie_rx_overflow_buffers += (uint64_t)level;
+            dev->rx_user_count    = writer;
+            dev->rx_release_count = writer;
+            m2sdr_pcie_dma_update_rx_release(dev);
+            continue;
+        }
+        bool full  = q.used == q.slots;
+        int  error = q.error;
+        pthread_mutex_unlock(&q.lock);
+        if (error) {
+            ret = error;
+            break;
+        }
+
+        int64_t avail = writer - dev->rx_user_count;
+        bool    last  = remaining && remaining <= (uint64_t)(avail * bsize);
+        if (full || (avail < chunk && !last)) {
+            /* Let a chunk accumulate (~4 ms at 122.88 MSPS sc16 with 256 x 8 KiB), or the writer
+             * free a slot (queue full: the disk is a whole queue behind). */
+            nanosleep(&nap, NULL);
+            continue;
+        }
+
+        int64_t ring_slot = dev->rx_user_count % count;
+        int64_t run = avail < chunk ? avail : chunk;
+        if (run > count - ring_slot)
+            run = count - ring_slot;
+        uint64_t bytes = (uint64_t)(run * bsize);
+        if (remaining && bytes > remaining) {
+            bytes = remaining;
+            run   = (int64_t)((bytes + (uint64_t)bsize - 1) / (uint64_t)bsize);
+        }
+
+        /* q.head is reader-owned until published. */
+        memcpy(q.mem + (size_t)q.head * q.slot_bytes, dma->buf_rd + ring_slot * bsize, (size_t)bytes);
+
+        /* The DMA loops without back-pressure: if it reached these ring slots again during the
+         * copy, part of what was copied may be newer data. */
+        litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
+                            &dma->writer_hw_count, &dma->writer_sw_count);
+        bool torn = dma->writer_hw_count - dev->rx_user_count >= count;
+
+        dev->rx_user_count    += run;
+        dev->rx_release_count += run;
+        m2sdr_pcie_dma_update_rx_release(dev);
+
+        pthread_mutex_lock(&q.lock);
+        q.len[q.head] = (size_t)bytes;
+        q.head = (q.head + 1) % q.slots;
+        q.used++;
+        if ((uint64_t)q.used * q.slot_bytes > stats->queue_high_water)
+            stats->queue_high_water = (uint64_t)q.used * q.slot_bytes;
+        stats->buffers += (uint64_t)run;
+        if (torn)
+            stats->torn_writes++;
+        pthread_cond_broadcast(&q.cond);
+        pthread_mutex_unlock(&q.lock);
+
+        if (remaining) {
+            remaining -= bytes;
+            if (!remaining)
+                break;
+        }
+        if (params->progress && m2sdr_monotonic_us() - last_report >= 1000000u) {
+            m2sdr_rx_fd_report(&q, params);
+            last_report = m2sdr_monotonic_us();
+        }
+    }
+
+    /* Drain: the writer finishes what is queued, then exits. */
+    pthread_mutex_lock(&q.lock);
+    q.done = true;
+    pthread_cond_broadcast(&q.cond);
+    pthread_mutex_unlock(&q.lock);
+    pthread_join(writer_thread, NULL);
+    if (q.error && ret == M2SDR_ERR_OK)
+        ret = q.error;
+    if (params->progress)
+        m2sdr_rx_fd_report(&q, params);
+
+    pthread_cond_destroy(&q.cond);
+    pthread_mutex_destroy(&q.lock);
+    free(q.len);
+    free(q.mem);
+    return ret;
 }
 
 /* Live DMA cursor as a MONOTONIC absolute buffer count (LitePCIe).

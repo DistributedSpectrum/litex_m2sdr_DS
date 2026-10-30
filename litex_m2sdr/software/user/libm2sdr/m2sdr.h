@@ -1031,6 +1031,53 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
  *   zero-copy streams; other current paths advance on read.
  */
 
+/* RX DMA ring -> file descriptor, with no copy (LitePCIe zero-copy RX streams).
+ *
+ * Copies runs of consecutive DMA ring buffers (up to chunk_buffers, never across the ring wrap)
+ * into a page-aligned RAM queue (queue_bytes) and releases them at once; a writer thread writes
+ * each queued run to the fd with one write(). A slow write (an SSD's housekeeping stalls) then
+ * fills the queue instead of overrunning the DMA ring. The queue copy is the only one: the fd
+ * can be opened with O_DIRECT to bypass the page cache (O_DIRECT cannot read the driver's
+ * PFN-mapped ring itself). A final partial buffer (max_bytes not a multiple of 4096) is written
+ * with O_DIRECT cleared. Headers, if enabled, stay in the data.
+ *
+ * Requires a stream configured with m2sdr_sync_config_ex() and zero_copy set. Runs until
+ * max_bytes are written (0: no limit), *keep_running reads 0, or a write fails. Overruns
+ * (writer more than half a ring behind) resync to the live writer like m2sdr_get_buffer() and
+ * leave a gap in the file; they are counted in the stats and in m2sdr_get_stream_stats(). */
+struct m2sdr_rx_to_fd_stats {
+    uint64_t bytes;             /* Bytes written to fd.                                       */
+    uint64_t buffers;           /* DMA buffers written.                                       */
+    uint64_t writes;            /* write() calls.                                              */
+    uint64_t overflow_events;   /* Overruns: resyncs after falling over half a ring behind.  */
+    uint64_t overflow_buffers;  /* Buffers skipped by those resyncs (gaps in the file).       */
+    uint64_t torn_writes;       /* Writes the DMA may have overwritten (lapped) while writing. */
+    uint64_t ring_high_water;   /* Deepest backlog, in buffers.                               */
+    uint64_t max_write_us;      /* Slowest single write().                                     */
+    uint64_t queue_high_water;  /* Most RAM queue bytes waiting for the disk.                 */
+};
+
+struct m2sdr_rx_to_fd_params {
+    int fd;                         /* Output; O_DIRECT recommended.                          */
+    uint64_t max_bytes;             /* Stop after this many bytes (0: no limit).             */
+    unsigned chunk_buffers;         /* DMA buffers per write (0: 256); at most half the ring. */
+    const volatile int *keep_running; /* Optional: stop once it reads 0.                       */
+    void (*progress)(const struct m2sdr_rx_to_fd_stats *stats, void *user); /* Optional, ~1 Hz. */
+    void *user;
+    size_t queue_bytes;             /* RAM queue between ring and disk (0: 256 MiB).         */
+};
+
+int m2sdr_rx_stream_to_fd(struct m2sdr_dev *dev,
+                          const struct m2sdr_rx_to_fd_params *params,
+                          struct m2sdr_rx_to_fd_stats *stats);
+
+/* Trim the free space of the filesystem holding path, as fstrim does, so an SSD can rebuild its
+ * dynamic write cache before the next capture (run it after deleting old captures; the cache
+ * refills while the drive idles). Uses the FITRIM ioctl when the caller has CAP_SYS_ADMIN
+ * (trimmed_bytes, if given, is then set); otherwise runs "sudo -n fstrim <mountpoint>", which
+ * needs a NOPASSWD sudoers rule for fstrim. Returns M2SDR_ERR_IO if neither works. */
+int m2sdr_fstrim(const char *path, uint64_t *trimmed_bytes);
+
 /* Small utility helpers for buffer sizing and allocation. */
 size_t m2sdr_format_size(enum m2sdr_format format);
 size_t m2sdr_samples_to_bytes(enum m2sdr_format format, unsigned num_samples);

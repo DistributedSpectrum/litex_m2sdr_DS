@@ -160,6 +160,37 @@ For PCIe/PTM host-time synchronization, build the gateware with
 from `CLOCK_REALTIME` through `phc2sys`; Soapy then observes the same board
 hardware time as the rest of the host stack.
 
+### RX Record-to-Disk Mode (PCIe)
+
+An RX stream set up with the `record` stream arg writes the DMA ring straight to a file while it
+is active (libm2sdr `m2sdr_rx_stream_to_fd()`, the same path as `m2sdr_record --direct`). It
+sustains 122.88 MSPS sc16 (491.5 MB/s) to NVMe on a Jetson Orin Nano with no drops, which a
+`readStream()` loop cannot. The file holds the native DMA samples (`CS16` or `CS8` only) and
+`readStream()` returns `SOAPY_SDR_NOT_SUPPORTED` on such a stream.
+
+| Stream arg | Default | Meaning |
+|---|---|---|
+| `record` | — | Output file; enables record mode |
+| `record_bytes` | `0` | Stop after this many bytes (0: until `deactivateStream()`) |
+| `record_header` | `0` | Keep the 16-byte DMA header (sync word + ns timestamp) in every 8 KiB buffer |
+| `record_direct` | `1` | O_DIRECT (bypass the page cache) |
+| `record_chunk` | `0` | DMA buffers per write (0: 256, at most half the ring) |
+| `record_fstrim` | `1` | Trim the file's filesystem when the capture stops (needs root or `sudo -n fstrim`) |
+
+`readSetting("rx_record_status")` reports `running`, `bytes`, `buffers`, `overflows`,
+`overflow_buffers`, `torn_writes`, `high_water`, `max_write_ms` and `result`. Full rate needs the
+gateware's 2048-buffer DMA ring (`--pcie-dma-table-depth=2048`).
+
+```python
+st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, [0],
+                     {"record": "/data/capture.bin", "record_bytes": str(30 * 491_520_000)})
+sdr.setSampleRate(SOAPY_SDR_RX, 0, 122.88e6)
+sdr.activateStream(st)
+while "running=1" in sdr.readSetting("rx_record_status"):
+    time.sleep(1)
+sdr.deactivateStream(st); sdr.closeStream(st)
+```
+
 ---
 
 ## srsRAN 4G

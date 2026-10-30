@@ -272,8 +272,19 @@ class AD9361RXBitMode64b(LiteXModule):
             for i in range(4)
         ]
         beat_max = _max4(self, sample_abs)
+        # Register each accepted beat's max and fold it into the running max one cycle later:
+        # sample-abs -> max4 -> running-max compare in one cycle off the RX CDC output is the
+        # sys-clock critical path (it failed timing once the CDC grew). BFP8_FOLD absorbs the
+        # last beat before BFP8_EXP reads the max (one more cycle per block).
+        beat_accept  = Signal()
+        beat_valid   = Signal()
+        beat_max_reg = Signal(13)
+        self.sync += [
+            beat_valid.eq(beat_accept),
+            beat_max_reg.eq(beat_max),
+        ]
         next_max_abs = Signal(13)
-        self.comb += next_max_abs.eq(Mux(bfp8_max_abs > beat_max, bfp8_max_abs, beat_max))
+        self.comb += next_max_abs.eq(Mux(bfp8_max_abs > beat_max_reg, bfp8_max_abs, beat_max_reg))
 
         self.bfp8_fsm = bfp8_fsm = FSM(reset_state="BFP8_COLLECT")
         bfp8_fsm.act("BFP8_COLLECT",
@@ -284,16 +295,27 @@ class AD9361RXBitMode64b(LiteXModule):
                 sink.ready.eq(bfp8_fifo.sink.ready),
                 bfp8_fifo.sink.valid.eq(sink.valid),
                 bfp8_fifo.sink.data.eq(sink.data),
-                If(sink.valid & sink.ready,
+                beat_accept.eq(sink.valid & sink.ready),
+                If(beat_valid,
                     NextValue(bfp8_max_abs, next_max_abs),
+                ),
+                If(sink.valid & sink.ready,
                     *bfp8_timestamp_latch,
                     If(bfp8_collect_count == (bfp8_input_words - 1),
                         NextValue(bfp8_collect_count, 0),
-                        NextState("BFP8_EXP"),
+                        NextState("BFP8_FOLD"),
                     ).Else(
                         NextValue(bfp8_collect_count, bfp8_collect_count + 1),
                     )
                 )
+            )
+        )
+        bfp8_fsm.act("BFP8_FOLD",
+            If(mode != _BFP8_MODE,
+                NextState("BFP8_COLLECT"),
+            ).Else(
+                NextValue(bfp8_max_abs, next_max_abs),
+                NextState("BFP8_EXP"),
             )
         )
         # Derive the block exponent from the REGISTERED max in its own cycle.
