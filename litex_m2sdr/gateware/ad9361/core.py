@@ -22,6 +22,7 @@ from litex_m2sdr.gateware.ad9361.phy              import AD9361PHY
 from litex_m2sdr.gateware.ad9361.phy_oversampling import AD9361OversamplingPHY
 from litex_m2sdr.gateware.ad9361.spi     import AD9361SPIMaster
 from litex_m2sdr.gateware.ad9361.bitmode import AD9361TXBitMode, AD9361RXBitMode
+from litex_m2sdr.gateware.ad9361.bitmode import RX_TIMESTAMP_WIDTH, rx_layout
 from litex_m2sdr.gateware.ad9361.bitmode import _sign_extend
 from litex_m2sdr.gateware.ad9361.prbs    import AD9361PRBSGenerator, AD9361PRBSChecker
 from litex_m2sdr.gateware.ad9361.prbs    import AD9361PRBS1R1TGenerator, AD9361PRBS1R1TChecker
@@ -90,9 +91,10 @@ from litex_m2sdr.gateware.ad9361.agc     import (
 # AD9361 RFIC --------------------------------------------------------------------------------------
 
 class AD9361RFICStreamBypass(LiteXModule):
-    def __init__(self, data_width=64):
-        self.sink   = stream.Endpoint(dma_layout(data_width))
-        self.source = stream.Endpoint(dma_layout(data_width))
+    def __init__(self, data_width=64, layout=None):
+        layout = dma_layout(data_width) if layout is None else layout
+        self.sink   = stream.Endpoint(layout)
+        self.source = stream.Endpoint(layout)
 
         # # #
 
@@ -103,7 +105,8 @@ class AD9361RFIC(LiteXModule):
     def __init__(self, rfic_pads, spi_pads, sys_clk_freq,
         with_tx_fifo = False, tx_fifo_depth = 8192,
         with_rx_fifo = False, rx_fifo_depth = 8192,
-        oversampling = False):
+        oversampling = False,
+        with_rx_timestamp = False):
         # oversampling=True selects the 2T2R @ 122.88 MSPS PHY (phy_oversampling.py: OSERDESE2 TX,
         # per-lane RX deskew, no internal loopback) and runs the DMA-facing datapath (sink/source,
         # buffers, bitmode, CDC) at 128-bit = two (ia,qa,ib,qb) groups per word, halving the
@@ -113,9 +116,16 @@ class AD9361RFIC(LiteXModule):
         # keeps the standard PHY (phy.py) and the 64-bit datapath unchanged.
         self.oversampling = oversampling
         dw = 128 if oversampling else 64
+        # with_rx_timestamp=True adds a "timestamp" field to the RX stream: a free-running count
+        # of rfic_clk cycles (245.76 MHz at 122.88 MSPS 1T1R / 61.44 MSPS 2T2R), written into the
+        # RX RFIC FIFO along with each valid sample word and carried across to source. Not
+        # supported with oversampling: a 64-bit counter does not close timing at 491.52 MHz.
+        assert not (with_rx_timestamp and oversampling), "RX timestamps require oversampling=False."
+        self.with_rx_timestamp = with_rx_timestamp
+        rx_dw_layout = rx_layout(dw, with_rx_timestamp)
         # Stream Endpoints -------------------------------------------------------------------------
         self.sink   = stream.Endpoint(dma_layout(dw))
-        self.source = stream.Endpoint(dma_layout(dw))
+        self.source = stream.Endpoint(rx_dw_layout)
 
         # Config/Control/Status registers ----------------------------------------------------------
         self._config = CSRStorage(fields=[
@@ -234,7 +244,7 @@ class AD9361RFIC(LiteXModule):
                 with_common_rst = True
             )
             self.rx_cdc = rx_cdc = stream.ClockDomainCrossing(
-                layout  = dma_layout(dw),
+                layout  = rx_dw_layout,
                 cd_from = "rfic",
                 cd_to   = "sys",
                 with_common_rst = True
@@ -242,7 +252,7 @@ class AD9361RFIC(LiteXModule):
 
         # Buffers (For Timings) --------------------------------------------------------------------
         self.tx_buffer = tx_buffer = stream.Buffer(dma_layout(dw))
-        self.rx_buffer = rx_buffer = stream.Buffer(dma_layout(dw))
+        self.rx_buffer = rx_buffer = stream.Buffer(rx_dw_layout)
         self.tx_rfic_fifo_started = tx_rfic_fifo_started = Signal()
         if with_tx_fifo:
             self.tx_rfic_fifo = tx_rfic_fifo = ClockDomainsRenamer("rfic")(
@@ -264,14 +274,14 @@ class AD9361RFIC(LiteXModule):
 
         if with_rx_fifo:
             self.rx_rfic_fifo = rx_rfic_fifo = ClockDomainsRenamer("rfic")(
-                stream.SyncFIFO(dma_layout(dw), depth=rx_fifo_depth, buffered=True)
+                stream.SyncFIFO(rx_dw_layout, depth=rx_fifo_depth, buffered=True)
             )
         else:
-            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass(dw)
+            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass(dw, layout=rx_dw_layout)
 
         # BitMode ----------------------------------------------------------------------------------
         self.tx_bitmode = tx_bitmode = AD9361TXBitMode(data_width=dw)
-        self.rx_bitmode = rx_bitmode = AD9361RXBitMode(data_width=dw)
+        self.rx_bitmode = rx_bitmode = AD9361RXBitMode(data_width=dw, with_timestamp=with_rx_timestamp)
         self.comb += tx_bitmode.mode.eq(self._bitmode.fields.mode)
         self.comb += rx_bitmode.mode.eq(self._bitmode.fields.mode)
 
@@ -324,6 +334,16 @@ class AD9361RFIC(LiteXModule):
             rx_stages.append(rx_gather)
         rx_stages += [rx_rfic_fifo, rx_cdc, rx_bitmode, rx_buffer, self.source]
         self.rx_pipeline = stream.Pipeline(*rx_stages)
+
+        # RX Timestamp.
+        # -------------
+        # Counts every rfic_clk cycle; the FIFO only stores it with a valid sample word, so each
+        # word reaches the sys domain stamped with the cycle it entered the FIFO (a fixed PHY/packer
+        # latency after capture). In 1R1T a word holds two samples: 'b' is 'a' + 2 cycles.
+        if with_rx_timestamp:
+            self.rx_timestamp = rx_timestamp = Signal(RX_TIMESTAMP_WIDTH)
+            self.sync.rfic += rx_timestamp.eq(rx_timestamp + 1)
+            self.comb += rx_rfic_fifo.sink.timestamp.eq(rx_timestamp)
 
     def add_timing_constraints(self, platform):
         """Vivado timing exceptions for the oversampling (491.52 MHz rfic_clk) datapath.

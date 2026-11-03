@@ -9,13 +9,19 @@ from migen import *
 from migen.sim import passive
 import random
 
+from litex.gen import LiteXModule
 from litex.gen.sim import run_simulation
 
+from litex.soc.interconnect import stream
+
+from litex_m2sdr.gateware.ad9361 import core
 from litex_m2sdr.gateware.ad9361.bitmode import (
     AD9361RXBitMode,
     AD9361TXBitMode,
     BFP8_HEADER_MAGIC,
+    BFP8_PAYLOAD_WORDS,
 )
+from litex_m2sdr.gateware.ad9361.phy import phy_layout
 from litex_m2sdr.gateware.ad9361.prbs import AD9361PRBSChecker, AD9361PRBSGenerator
 
 # AD9361 BitMode Tests ----------------------------------------------------------------------------
@@ -536,3 +542,121 @@ def test_ad9361_rx_bitmode_128b_16bit_passthrough():
 
     run_simulation(dut, [gen(), mon()])
     assert out == [word]
+
+# AD9361 RX Timestamp Tests -----------------------------------------------------------------------
+
+def _rx_bitmode_timestamp_run(mode, words, bfp8_payload_words=BFP8_PAYLOAD_WORDS, stall=False):
+    """Feed (data, timestamp) words into a timestamped RX bitmode; return (data, timestamp) out."""
+    dut = AD9361RXBitMode(bfp8_payload_words=bfp8_payload_words, with_timestamp=True)
+    out = []
+    prng = random.Random(7)
+
+    def gen():
+        yield dut.mode.eq(mode)
+        for data, ts in words:
+            yield dut.sink.valid.eq(1)
+            yield dut.sink.data.eq(data)
+            yield dut.sink.timestamp.eq(ts)
+            yield
+            while not (yield dut.sink.ready):
+                yield
+        yield dut.sink.valid.eq(0)
+        for _ in range(64):
+            yield
+
+    @passive
+    def mon():
+        while True:
+            yield dut.source.ready.eq(prng.randrange(3) != 0 if stall else 1)
+            yield
+            if (yield dut.source.valid) and (yield dut.source.ready):
+                out.append(((yield dut.source.data), (yield dut.source.timestamp)))
+
+    run_simulation(dut, [gen(), mon()])
+    return out
+
+
+def test_ad9361_rx_bitmode_16bit_forwards_timestamp():
+    """Verify 16-bit mode forwards each word's timestamp with it."""
+    words = [(0x1000 + i, 1000 + 4*i) for i in range(8)]
+    out = _rx_bitmode_timestamp_run(0, words, stall=True)
+    assert out == words
+
+
+def test_ad9361_rx_bitmode_8bit_timestamp_is_first_word():
+    """Verify 8-bit mode stamps each packed word with its first input word's timestamp."""
+    words = [(0, 1000 + 4*i) for i in range(16)]
+    out = _rx_bitmode_timestamp_run(1, words, stall=True)
+    assert [ts for _, ts in out] == [1000 + 8*i for i in range(8)]
+
+
+def test_ad9361_rx_bitmode_bfp8_timestamp_is_block_start():
+    """Verify BFP8 stamps a block's header and payload with its first input word's timestamp."""
+    words = [(0, 1000 + 4*i) for i in range(8)]
+    out = _rx_bitmode_timestamp_run(2, words, bfp8_payload_words=2, stall=True)
+    # Two blocks of 1 header + 2 payload words, each packing 4 input words.
+    assert [ts for _, ts in out] == [1000]*3 + [1016]*3
+
+
+class _SimRXPHY(LiteXModule):
+    """Sim stand-in for AD9361PHY: one RX word every `period` (a power of 2) rfic cycles, ia = word index."""
+    def __init__(self, rfic_pads, period=4):
+        self.sink   = stream.Endpoint(phy_layout())
+        self.source = stream.Endpoint(phy_layout())
+        self.cycle  = cycle = Signal(64)
+        self.index  = index = Signal(12)
+
+        # # #
+
+        self.comb += self.sink.ready.eq(1)
+        self.sync.rfic += [
+            cycle.eq(cycle + 1),
+            self.source.valid.eq((cycle & (period - 1)) == period - 1),
+            If(self.source.valid, index.eq(index + 1)),
+        ]
+        self.comb += self.source.ia.eq(index)
+
+
+def test_ad9361_rfic_rx_timestamp_counts_rfic_cycles_across_cdc(monkeypatch):
+    """Verify every RX word reaches sys stamped with the rfic cycle it entered the RX FIFO,
+    despite sys-side stalls (rfic and sys clocked at the 245.76/125 MHz ratio)."""
+    period = 4
+    monkeypatch.setattr(core, "AD9361PHY", lambda pads: _SimRXPHY(pads, period=period))
+    rfic_pads = Record([("rst_n", 1), ("enable", 1), ("txnrx", 1), ("en_agc", 1),
+                        ("ctrl", 4), ("stat", 8)])
+    spi_pads  = Record([("clk", 1), ("cs_n", 1), ("mosi", 1), ("miso", 1)])
+    rfic = core.AD9361RFIC(rfic_pads, spi_pads, sys_clk_freq=125e6,
+        with_rx_fifo=True, rx_fifo_depth=64, with_rx_timestamp=True)
+    # The RX CDC uses ResetSignal("sys"): give the sim a sys domain with a reset.
+    dut = LiteXModule()
+    dut.cd_sys = ClockDomain()
+    dut.rfic   = rfic
+    out  = []
+    prng = random.Random(3)
+
+    @passive
+    def mon():
+        while True:
+            # Accept 3 of 4 cycles: ~94 Mwords/s against the 61.44 Mwords/s input.
+            yield rfic.source.ready.eq(prng.randrange(4) != 0)
+            yield
+            if (yield rfic.source.valid) and (yield rfic.source.ready):
+                out.append(((yield rfic.source.data) & 0xfff, (yield rfic.source.timestamp)))
+
+    def run():
+        for _ in range(600):
+            yield
+
+    # 245.76 / 125 MHz ~= 1.97. The RX CDC's common reset re-derives its two clock domains
+    # combinationally, which the simulator does not clock: drive them like their parents.
+    clocks = {"sys": 26, "rfic": 13}
+    cdc_from, cdc_to = [cd.name for cd in rfic.rx_cdc._fragment.clock_domains]
+    clocks.update({cdc_from: clocks["rfic"], cdc_to: clocks["sys"]})
+    run_simulation(dut, {"sys": [mon(), run()]}, clocks=clocks)
+
+    assert len(out) > 100
+    indices = [i for i, _ in out]
+    assert indices == [i & 0xfff for i in range(indices[0], indices[0] + len(out))]
+    # PHY valid is registered: word i is presented, and written, at rfic cycle period*(i+1).
+    for i, ts in out:
+        assert ts == period*(i + 1), (i, ts)
