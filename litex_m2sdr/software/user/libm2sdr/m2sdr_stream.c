@@ -56,18 +56,124 @@ static unsigned m2sdr_sample_size(enum m2sdr_format format)
     }
 }
 
+/* RX gain tag word (see m2sdr.h): the 0x5aa5 sync in bits [15:0] (shared with the legacy word)
+ * and the version in bits [19:16] (the legacy word has 5 there). */
+#define M2SDR_RX_GAIN_TAG_SYNC          0x5aa5u
+#define M2SDR_RX_GAIN_TAG_VERSION_SHIFT 16
+
+static int m2sdr_is_rx_gain_tag_word(uint64_t word)
+{
+    return (word & 0xffffu) == M2SDR_RX_GAIN_TAG_SYNC &&
+           ((word >> M2SDR_RX_GAIN_TAG_VERSION_SHIFT) & 0xfu) == M2SDR_RX_GAIN_TAG_VERSION_1;
+}
+
 static int m2sdr_parse_dma_header(const uint8_t *buf, uint64_t *timestamp)
 {
     uint64_t sync_word = 0;
     uint64_t ts = 0;
 
     memcpy(&sync_word, buf, sizeof(sync_word));
-    if (sync_word != M2SDR_DMA_HEADER_SYNC_WORD)
+    /* The RX gain tag replaces the sync word but keeps the same timestamp word. */
+    if (sync_word != M2SDR_DMA_HEADER_SYNC_WORD && !m2sdr_is_rx_gain_tag_word(sync_word))
         return 0;
 
     memcpy(&ts, buf + 8, sizeof(ts));
     *timestamp = ts;
     return 1;
+}
+
+int m2sdr_parse_rx_gain_tag(const void *header, struct m2sdr_rx_gain_tag *tag)
+{
+    const uint8_t *buf = (const uint8_t *)header;
+    uint64_t word = 0;
+    uint64_t ts = 0;
+
+    if (!buf || !tag)
+        return M2SDR_ERR_INVAL;
+    memset(tag, 0, sizeof(*tag));
+    memcpy(&word, buf, sizeof(word));
+    memcpy(&ts, buf + 8, sizeof(ts));
+    if (word == M2SDR_DMA_HEADER_SYNC_WORD)
+        return 0;
+    if (!m2sdr_is_rx_gain_tag_word(word))
+        return M2SDR_ERR_PARSE;
+
+    tag->timestamp  = ts;
+    tag->version    = M2SDR_RX_GAIN_TAG_VERSION_1;
+    tag->flags      = (unsigned)((word >> 20) & 0x7u); /* VALID, LOCK, CHANGED in order. */
+    tag->gain_index = (uint8_t)((word >> 24) & 0x7fu);
+    tag->gain_index_min = tag->gain_index;
+    tag->gain_index_max = tag->gain_index;
+    for (unsigned c = 0; c < M2SDR_RX_GAIN_TAG_CHUNKS; c++) {
+        uint8_t idx = (uint8_t)((word >> (32 + 8 * c)) & 0x7fu);
+        tag->chunk_gain_index[c] = idx;
+        if (idx < tag->gain_index_min)
+            tag->gain_index_min = idx;
+        if (idx > tag->gain_index_max)
+            tag->gain_index_max = idx;
+    }
+    return 1;
+}
+
+unsigned m2sdr_rx_gain_tag_chunk(enum m2sdr_format format, unsigned msg_samples, unsigned sample_in_msg)
+{
+    /* Chunks are counted in 64-bit stream words (see m2sdr.h). */
+    unsigned sample_sz = m2sdr_sample_size(format);
+    unsigned words, chunk_words, word, chunk;
+
+    if (!sample_sz)
+        return 0;
+    words       = (unsigned)(((uint64_t)msg_samples * sample_sz) / 8u);
+    chunk_words = words / M2SDR_RX_GAIN_TAG_CHUNKS;
+    if (chunk_words == 0)
+        chunk_words = 1;
+    word  = (unsigned)(((uint64_t)sample_in_msg * sample_sz) / 8u);
+    chunk = word / chunk_words;
+    return chunk < M2SDR_RX_GAIN_TAG_CHUNKS ? chunk : M2SDR_RX_GAIN_TAG_CHUNKS - 1;
+}
+
+/* Record one DMA buffer's slice of an m2sdr_sync_rx() block (no-op unless the tag is on). */
+static void m2sdr_record_rx_gain_tag(struct m2sdr_dev *dev, const uint8_t *header,
+                                     unsigned sample_offset, unsigned sample_count,
+                                     unsigned msg_samples)
+{
+    struct m2sdr_rx_gain_tag tag;
+
+    if (!dev->rx_gain_tag_enable || !dev->rx_header_enable)
+        return;
+    if (m2sdr_parse_rx_gain_tag(header, &tag) != 1)
+        return;
+    if (dev->rx_gain_tags_num == dev->rx_gain_tags_cap) {
+        size_t cap = dev->rx_gain_tags_cap ? dev->rx_gain_tags_cap * 2 : 64;
+        struct m2sdr_rx_gain_tag_msg *grown = realloc(dev->rx_gain_tags, cap * sizeof(*grown));
+        if (!grown)
+            return; /* Out of memory: drop the entry, the tiling shows a gap. */
+        dev->rx_gain_tags     = grown;
+        dev->rx_gain_tags_cap = cap;
+    }
+    struct m2sdr_rx_gain_tag_msg *msg = &dev->rx_gain_tags[dev->rx_gain_tags_num++];
+    msg->tag               = tag;
+    msg->sample_offset     = sample_offset;
+    msg->sample_count      = sample_count;
+    msg->msg_sample_offset = 0; /* m2sdr_sync_rx() always copies from the start of a frame. */
+    msg->msg_samples       = msg_samples;
+}
+
+int m2sdr_get_rx_gain_tags(struct m2sdr_dev *dev,
+                           struct m2sdr_rx_gain_tag_msg *tags,
+                           size_t max_tags,
+                           size_t *num_tags)
+{
+    if (!dev || !num_tags || (max_tags && !tags))
+        return M2SDR_ERR_INVAL;
+    *num_tags = 0;
+    if (!dev->rx_gain_tag_enable)
+        return M2SDR_ERR_UNSUPPORTED;
+    size_t n = dev->rx_gain_tags_num < max_tags ? dev->rx_gain_tags_num : max_tags;
+    if (n)
+        memcpy(tags, dev->rx_gain_tags, n * sizeof(*tags));
+    *num_tags = dev->rx_gain_tags_num;
+    return M2SDR_ERR_OK;
 }
 
 static void m2sdr_write_dma_header(uint8_t *buf, uint64_t timestamp)
@@ -1306,13 +1412,16 @@ int m2sdr_sync_rx(struct m2sdr_dev *dev,
     unsigned total_bytes = num_samples * sample_sz;
     unsigned copied = 0;
 
+    dev->rx_gain_tags_num = 0;
+
     while (copied < total_bytes) {
         if (dev->transport == M2SDR_TRANSPORT_LITEPCIE) {
             char *buf = NULL;
             int rc = m2sdr_wait_rx_buffer(dev, &buf, timeout_ms ? timeout_ms : dev->rx_timeout_ms);
             if (rc != M2SDR_ERR_OK)
                 return rc;
-            unsigned to_copy = m2sdr_stream_payload_bytes(dev, M2SDR_RX, dev->rx_format);
+            unsigned frame_bytes = m2sdr_stream_payload_bytes(dev, M2SDR_RX, dev->rx_format);
+            unsigned to_copy = frame_bytes;
             unsigned payload_off = 0;
             if (dev->rx_header_enable && dev->rx_strip_header)
                 payload_off = M2SDR_DMA_HEADER_SIZE;
@@ -1327,6 +1436,8 @@ int m2sdr_sync_rx(struct m2sdr_dev *dev,
                     meta->timestamp = ts;
                     meta->flags |= M2SDR_META_FLAG_HAS_TIME;
                 }
+                m2sdr_record_rx_gain_tag(dev, (const uint8_t *)buf, copied / sample_sz,
+                                         to_copy / sample_sz, frame_bytes / sample_sz);
             }
             memcpy((uint8_t *)samples + copied, buf + payload_off, to_copy);
             copied += to_copy;
@@ -1347,6 +1458,7 @@ int m2sdr_sync_rx(struct m2sdr_dev *dev,
                 payload_off = M2SDR_DMA_HEADER_SIZE;
                 to_copy = DMA_BUFFER_SIZE - M2SDR_DMA_HEADER_SIZE;
             }
+            unsigned frame_bytes = to_copy;
             if (to_copy > total_bytes - copied)
                 to_copy = total_bytes - copied;
             if (dev->rx_header_enable) {
@@ -1358,6 +1470,8 @@ int m2sdr_sync_rx(struct m2sdr_dev *dev,
                     meta->timestamp = ts;
                     meta->flags |= M2SDR_META_FLAG_HAS_TIME;
                 }
+                m2sdr_record_rx_gain_tag(dev, buf, copied / sample_sz,
+                                         to_copy / sample_sz, frame_bytes / sample_sz);
             }
             memcpy((uint8_t *)samples + copied, buf + payload_off, to_copy);
             copied += to_copy;
@@ -1692,6 +1806,23 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
         meta->flags |= M2SDR_META_FLAG_HAS_TIME;
     }
     return M2SDR_ERR_OK;
+}
+
+int m2sdr_get_buffer_rx_gain_tag(struct m2sdr_dev *dev,
+                                 const void *buffer,
+                                 struct m2sdr_rx_gain_tag *tag)
+{
+    if (!dev || !buffer || !tag)
+        return M2SDR_ERR_INVAL;
+    memset(tag, 0, sizeof(*tag));
+    if (!dev->rx_header_enable)
+        return 0;
+    /* Same header location rule as m2sdr_get_buffer_metadata(). */
+    const uint8_t *header = (const uint8_t *)buffer;
+    if (dev->rx_strip_header)
+        header -= M2SDR_DMA_HEADER_SIZE;
+    int rc = m2sdr_parse_rx_gain_tag(header, tag);
+    return rc == 1 ? 1 : 0;
 }
 
 static uint64_t m2sdr_monotonic_us(void)

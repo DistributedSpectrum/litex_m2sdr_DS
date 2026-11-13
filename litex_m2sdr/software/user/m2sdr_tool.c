@@ -13,7 +13,10 @@ int m2sdr_tool_parse_dma_header(const uint8_t *buf, uint64_t *timestamp)
         return 0;
 
     memcpy(&sync_word, buf, sizeof(sync_word));
-    if (sync_word != M2SDR_TOOL_DMA_HEADER_SYNC_WORD)
+    /* An RX gain-tagged header (0x5aa5 sync, version 1 at bits [19:16]; see m2sdr.h) keeps the
+     * timestamp word, so it parses like the legacy sync word. */
+    if (sync_word != M2SDR_TOOL_DMA_HEADER_SYNC_WORD &&
+        !((sync_word & 0xffffu) == 0x5aa5u && ((sync_word >> 16) & 0xfu) == 1u))
         return 0;
 
     memcpy(&ts, buf + 8, sizeof(ts));

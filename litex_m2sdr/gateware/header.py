@@ -13,10 +13,178 @@ from litepcie.common import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
 
+from litex_m2sdr.gateware.ad9361.bitmode import rx_layout
+from litex_m2sdr.gateware.ad9361.bitmode import RX_GAIN_INDEX_BITS, RX_GAIN_LOCK_BIT, RX_GAIN_VALID_BIT
+
+# RX Gain Tag --------------------------------------------------------------------------------------
+#
+# With the RX gain tag enabled, the 64-bit RX header word (the legacy constant sync word
+# 0x5aa55aa55aa55aa5) carries the AD9361 RX1 gain-table index over the frame that follows, in the
+# same spirit as bladeRF_DS's per-message gain tag (base + per-chunk end values):
+#
+#   bits [15: 0]  0x5aa5 sync (also the low 16 bits of the legacy word)
+#   bits [19:16]  tag version, 1 (the legacy word has 5 here, so the two never collide)
+#   bit  [20]     VALID   every word of the frame carried a settled CTRL_OUT byte
+#   bit  [21]     LOCK    CTRL_OUT[7] (RX1 gain lock) at the first word of the frame
+#   bit  [22]     CHANGED some word of the frame had a gain index different from BASE
+#   bits [30:24]  BASE    gain index at the first word of the frame
+#   bits [38:32]  END0    gain index at the last word of chunk 0
+#   bits [46:40]  END1    gain index at the last word of chunk 1
+#   bits [54:48]  END2    gain index at the last word of chunk 2
+#   bits [62:56]  END3    gain index at the last word of chunk 3 (= last word of the frame)
+#   bits 23, 31, 39, 47, 55, 63 are reserved (0).
+#
+# A frame is frame_cycles stream words. Chunk c (c = 0..2) is words [c*L, (c+1)*L) with
+# L = max(1, frame_cycles // 4); chunk 3 runs from 3*L to the end of the frame. A chunk the frame
+# never reaches (frame_cycles < 4) reports BASE.
+#
+# The header precedes its frame in the DMA buffer, so the frame is stored first: the framer writes
+# each word into a frame FIFO while it updates the tag, then queues {tag, timestamp} once the
+# frame's last word is in. The inserter emits a header only when a tag is queued, so the stream
+# is delayed by one frame. The timestamp is latched when the frame's first word reaches the framer
+# (not when the header leaves, as on the legacy path).
+
+RX_GAIN_TAG_SYNC    = 0x5aa5
+RX_GAIN_TAG_VERSION = 1
+RX_GAIN_TAG_CHUNKS  = 4
+
+def rx_gain_tag_word(valid, lock, changed, base, ends):
+    """Software model of the tag word (used by the tests and as the reference for decoders)."""
+    assert len(ends) == RX_GAIN_TAG_CHUNKS
+    word  = RX_GAIN_TAG_SYNC
+    word |= RX_GAIN_TAG_VERSION << 16
+    word |= int(bool(valid))   << 20
+    word |= int(bool(lock))    << 21
+    word |= int(bool(changed)) << 22
+    word |= (base & 0x7f)      << 24
+    for c, end in enumerate(ends):
+        word |= (end & 0x7f) << (32 + 8*c)
+    return word
+
+class RXGainTagFramer(LiteXModule):
+    """Store-and-forward one frame of RX words and build its gain tag.
+
+    sink:       RX words with the per-word "gain" side field (bitmode.rx_layout(with_gain)).
+    source:     the same words, without the side field, one frame behind.
+    tag_source: {tag, timestamp} per frame, queued once the frame's last word is stored.
+    """
+    def __init__(self, data_width=64, fifo_depth=2048, tag_depth=4):
+        self.sink         = sink       = stream.Endpoint(rx_layout(data_width, with_gain=True))
+        self.source       = source     = stream.Endpoint(dma_layout(data_width))
+        self.tag_source   = tag_source = stream.Endpoint([("tag", 64), ("timestamp", 64)])
+        self.frame_cycles = Signal(32) # i Frame length in words (>= 1, <= fifo_depth).
+        self.timestamp    = Signal(64) # i Stamp latched at each frame's first word.
+        self.flush        = Signal()   # i Drop stored words/tags and restart framing.
+        self.drain        = Signal()   # i While flushing: accept (and drop) incoming words.
+        self.fifo_depth   = fifo_depth
+
+        # # #
+
+        # FIFOs.
+        # ------
+        self.data_fifo = data_fifo = ResetInserter()(
+            stream.SyncFIFO(dma_layout(data_width), depth=fifo_depth, buffered=True))
+        self.tag_fifo  = tag_fifo  = ResetInserter()(
+            stream.SyncFIFO([("tag", 64), ("timestamp", 64)], depth=tag_depth, buffered=False))
+        self.comb += [
+            data_fifo.reset.eq(self.flush),
+            tag_fifo.reset.eq(self.flush),
+            data_fifo.source.connect(source),
+            tag_fifo.source.connect(tag_source),
+        ]
+
+        # Framing.
+        # --------
+        count     = Signal(32) # Word index in the frame.
+        chunk     = Signal(2)  # Current chunk.
+        chunk_cnt = Signal(32) # Word index in the chunk.
+        chunk_len = Signal(32) # L = max(1, frame_cycles // 4).
+        self.comb += chunk_len.eq(Mux(self.frame_cycles[2:] == 0, 1, self.frame_cycles[2:]))
+        first = Signal()
+        last  = Signal()
+        self.comb += [
+            first.eq(count == 0),
+            last.eq(count == (self.frame_cycles - 1)),
+        ]
+
+        # Tag state: registered over the frame, with the "_n" values including the current word.
+        gain_index = sink.gain[0:RX_GAIN_INDEX_BITS]
+        gain_lock  = sink.gain[RX_GAIN_LOCK_BIT]
+        gain_valid = sink.gain[RX_GAIN_VALID_BIT]
+        base,   base_n    = Signal(RX_GAIN_INDEX_BITS), Signal(RX_GAIN_INDEX_BITS)
+        lock,   lock_n    = Signal(), Signal()
+        valid,  valid_n   = Signal(), Signal()
+        changed, changed_n = Signal(), Signal()
+        ts,     ts_n      = Signal(64), Signal(64)
+        ends   = [Signal(RX_GAIN_INDEX_BITS, name=f"end{c}")   for c in range(RX_GAIN_TAG_CHUNKS)]
+        ends_n = [Signal(RX_GAIN_INDEX_BITS, name=f"end{c}_n") for c in range(RX_GAIN_TAG_CHUNKS)]
+        self.comb += [
+            base_n.eq(   Mux(first, gain_index, base)),
+            lock_n.eq(   Mux(first, gain_lock,  lock)),
+            valid_n.eq(  Mux(first, gain_valid, valid & gain_valid)),
+            changed_n.eq(Mux(first, 0,          changed | (gain_index != base))),
+            ts_n.eq(     Mux(first, self.timestamp, ts)),
+        ]
+        for c in range(RX_GAIN_TAG_CHUNKS):
+            # Last write wins: each chunk ends up holding the index at its last word. Every chunk
+            # starts the frame at the first word's index, so an unreached chunk reports BASE.
+            self.comb += ends_n[c].eq(Mux(first | (chunk == c), gain_index, ends[c]))
+
+        # Datapath.
+        # ---------
+        accept = Signal()
+        self.comb += [
+            If(self.flush,
+                sink.ready.eq(self.drain),
+            ).Else(
+                # The last word of a frame also needs room for its tag.
+                sink.ready.eq(data_fifo.sink.ready & (~last | tag_fifo.sink.ready)),
+                accept.eq(sink.valid & sink.ready),
+                data_fifo.sink.valid.eq(accept),
+                tag_fifo.sink.valid.eq(accept & last),
+            ),
+            data_fifo.sink.data.eq(sink.data),
+            tag_fifo.sink.tag.eq(Cat(
+                C(RX_GAIN_TAG_SYNC, 16), C(RX_GAIN_TAG_VERSION, 4),
+                valid_n, lock_n, changed_n, C(0, 1),
+                base_n, C(0, 1),
+                *[Cat(ends_n[c], C(0, 1)) for c in range(RX_GAIN_TAG_CHUNKS)],
+            )),
+            tag_fifo.sink.timestamp.eq(ts_n),
+        ]
+        self.sync += [
+            If(self.flush,
+                count.eq(0),
+                chunk.eq(0),
+                chunk_cnt.eq(0),
+            ).Elif(accept,
+                base.eq(base_n),
+                lock.eq(lock_n),
+                valid.eq(valid_n),
+                changed.eq(changed_n),
+                ts.eq(ts_n),
+                *[ends[c].eq(ends_n[c]) for c in range(RX_GAIN_TAG_CHUNKS)],
+                If(last,
+                    count.eq(0),
+                    chunk.eq(0),
+                    chunk_cnt.eq(0),
+                ).Else(
+                    count.eq(count + 1),
+                    If((chunk != (RX_GAIN_TAG_CHUNKS - 1)) & (chunk_cnt == (chunk_len - 1)),
+                        chunk.eq(chunk + 1),
+                        chunk_cnt.eq(0),
+                    ).Else(
+                        chunk_cnt.eq(chunk_cnt + 1),
+                    )
+                )
+            )
+        ]
+
 # Header Inserter/Extractor ------------------------------------------------------------------------
 
 class HeaderInserterExtractor(LiteXModule):
-    def __init__(self, mode="inserter", data_width=64, with_csr=True):
+    def __init__(self, mode="inserter", data_width=64, with_csr=True,
+        with_gain_tag=False, gain_tag_fifo_depth=2048):
         # The DMA header is a fixed 16 bytes (sync word + ns timestamp). At 64-bit it occupies
         # two stream words (HEADER then TIMESTAMP states); at 128-bit it fits in one word
         # ([timestamp(64) | sync(64)], low half = sync = first buffer bytes), so the FSM emits/
@@ -24,9 +192,16 @@ class HeaderInserterExtractor(LiteXModule):
         # so the sys-domain word rate halves (2T2R @ 122.88 MSPS fits the 64-bit @ 125MHz fabric).
         assert data_width in [64, 128]
         assert mode in ["inserter", "extractor"]
-        self.data_width = data_width
+        # with_gain_tag (inserter, 64-bit only): the sink carries the per-word RX "gain" side
+        # field and, when enabled at runtime (gain_tag_enable, with header_enable set), the header
+        # word becomes the RX gain tag (see RXGainTagFramer above).
+        assert not (with_gain_tag and mode != "inserter"), "The gain tag is an RX (inserter) feature."
+        assert not (with_gain_tag and data_width != 64), "The gain tag needs the 64-bit datapath."
+        self.data_width    = data_width
+        self.with_gain_tag = with_gain_tag
         single_word = (data_width == 128)
-        self.sink   = sink   = stream.Endpoint(dma_layout(data_width)) # i
+        sink_description = rx_layout(data_width, with_gain=True) if with_gain_tag else dma_layout(data_width)
+        self.sink   = sink   = stream.Endpoint(sink_description)       # i
         self.source = source = stream.Endpoint(dma_layout(data_width)) # o
 
         self.reset         = Signal() # i
@@ -59,6 +234,13 @@ class HeaderInserterExtractor(LiteXModule):
         # current stamping bit-exact.
         self.rx_offset      = Signal(64) # i  CSR: RX pipeline offset (ns).
 
+        # RX gain tag (inserter with with_gain_tag only).
+        self.gain_tag_enable = Signal()   # i  CSR: tag the header word (needs header_enable).
+        self.gain_tag_active = Signal()   # o  The tagged path is in use.
+        # Header word / timestamp actually inserted by the last header (inserter).
+        self.header_out     = Signal(64) # o
+        self.stamp_out      = Signal(64) # o
+
         if with_csr:
             self.add_csr()
 
@@ -90,6 +272,59 @@ class HeaderInserterExtractor(LiteXModule):
             Mux(self.timestamp >= self.rx_offset, self.timestamp - self.rx_offset, 0))
         self.stamp_time = stamp_time
 
+        # Header source (inserter).
+        # -------------------------
+        # fsm_sink is the stream the FSM frames. hdr_ready/hdr_word/hdr_ts are the header it
+        # emits: on the legacy path the constant header input and the live stamp, always ready;
+        # on the gain-tag path the framer's queued {tag, timestamp}, ready once a whole frame is
+        # stored behind it.
+        hdr_ready = Signal()
+        hdr_word  = Signal(64)
+        hdr_ts    = Signal(64)
+        hdr_pop   = Signal()
+        if with_gain_tag:
+            fsm_sink = stream.Endpoint(dma_layout(data_width))
+            self.framer = framer = RXGainTagFramer(data_width, fifo_depth=gain_tag_fifo_depth)
+            tagged = self.gain_tag_active
+            fsm_reset = Signal()
+            self.comb += [
+                # Frames longer than the frame FIFO could never complete: keep those untagged.
+                tagged.eq(self.header_enable & self.gain_tag_enable &
+                    (frame_cycles_eff <= gain_tag_fifo_depth)),
+                fsm_reset.eq(self.reset | ~self.enable),
+                framer.frame_cycles.eq(frame_cycles_eff),
+                framer.timestamp.eq(stamp_time),
+                framer.flush.eq(fsm_reset | ~tagged),
+                framer.drain.eq(self.reset),
+                If(tagged,
+                    sink.connect(framer.sink),
+                    framer.source.connect(fsm_sink),
+                    hdr_ready.eq(framer.tag_source.valid),
+                    hdr_word.eq(framer.tag_source.tag),
+                    hdr_ts.eq(framer.tag_source.timestamp),
+                    framer.tag_source.ready.eq(hdr_pop),
+                ).Else(
+                    sink.connect(fsm_sink, omit={"gain"}),
+                    hdr_ready.eq(1),
+                    hdr_word.eq(self.header),
+                    hdr_ts.eq(stamp_time),
+                ),
+            ]
+        else:
+            fsm_sink = sink
+            self.comb += [
+                hdr_ready.eq(1),
+                hdr_word.eq(self.header),
+                hdr_ts.eq(stamp_time),
+            ]
+        # Default: the live values (what the legacy path inserts); latched below on each header.
+        header_out_q = Signal(64)
+        stamp_out_q  = Signal(64)
+        self.comb += [
+            self.header_out.eq(header_out_q),
+            self.stamp_out.eq(stamp_out_q),
+        ]
+
         # FSM.
         # ----
         self.fsm = fsm = ResetInserter()(FSM(reset_state="RESET"))
@@ -105,7 +340,7 @@ class HeaderInserterExtractor(LiteXModule):
             # producer does not stall against a held-in-reset inserter. (The
             # mode selection is an elaboration-time constant, hence the
             # Python conditional.)
-            reset_actions.append(sink.ready.eq(self.reset))
+            reset_actions.append(fsm_sink.ready.eq(self.reset))
         fsm.act("RESET", *reset_actions)
 
         # Idle.
@@ -124,30 +359,44 @@ class HeaderInserterExtractor(LiteXModule):
                 # 128-bit: sync + timestamp (antenna-plane corrected, see stamp_time above) in
                 # one word -> straight to FRAME.
                 fsm.act("HEADER",
-                    source.valid.eq(1),
+                    source.valid.eq(hdr_ready),
                     source.first.eq(1),
-                    source.data[0:64].eq(self.header),
-                    source.data[64:128].eq(stamp_time),
+                    source.data[0:64].eq(hdr_word),
+                    source.data[64:128].eq(hdr_ts),
                     If(source.valid & source.ready,
+                        hdr_pop.eq(1),
+                        NextValue(header_out_q, hdr_word),
+                        NextValue(stamp_out_q, hdr_ts),
                         NextValue(self.update, 1),
                         NextState("FRAME"),
                     )
                 )
             else:
                 # 64-bit: sync word, then timestamp word.
+                # The timestamp word goes out after the sync word. On the gain-tag path the tag
+                # is popped with the first word, so its timestamp is held until the second; the
+                # legacy path keeps stamping the live time in the TIMESTAMP state (bit-exact with
+                # the pre-gain-tag gateware).
+                hdr_ts_q = Signal(64)
+                ts_word  = Signal(64)
+                self.comb += ts_word.eq(Mux(self.gain_tag_active, hdr_ts_q, stamp_time))
                 fsm.act("HEADER",
-                    source.valid.eq(1),
+                    source.valid.eq(hdr_ready),
                     source.first.eq(1),
-                    source.data[0:64].eq(self.header),
+                    source.data[0:64].eq(hdr_word),
                     If(source.valid & source.ready,
+                        hdr_pop.eq(1),
+                        NextValue(header_out_q, hdr_word),
+                        NextValue(hdr_ts_q, hdr_ts),
                         NextState("TIMESTAMP"),
                     )
                 )
                 # Timestamp (antenna-plane corrected, see stamp_time above).
                 fsm.act("TIMESTAMP",
                     source.valid.eq(1),
-                    source.data[0:64].eq(stamp_time),
+                    source.data[0:64].eq(ts_word),
                     If(source.valid & source.ready,
+                        NextValue(stamp_out_q, ts_word),
                         NextValue(self.update, 1),
                         NextState("FRAME"),
                     )
@@ -237,7 +486,7 @@ class HeaderInserterExtractor(LiteXModule):
 
         # Frame.
         fsm.act("FRAME",
-            sink.connect(source, omit={"first"}),
+            fsm_sink.connect(source, omit={"first"}),
             NextValue(self.update, 0),
             If(self.header_enable,
                 source.first.eq((cycles == 0) & (mode == "extractor")),
@@ -297,22 +546,23 @@ class TXHeaderExtractor(HeaderInserterExtractor):
 # RX Header Inserter -------------------------------------------------------------------------------
 
 class RXHeaderInserter(HeaderInserterExtractor):
-    def __init__(self, data_width=128, with_csr=True):
+    def __init__(self, data_width=128, with_csr=True, with_gain_tag=False):
         HeaderInserterExtractor.__init__(self,
-            mode       = "inserter",
-            data_width = data_width,
-            with_csr   = with_csr,
+            mode          = "inserter",
+            data_width    = data_width,
+            with_csr      = with_csr,
+            with_gain_tag = with_gain_tag,
         )
 
 # TX/RX Header -------------------------------------------------------------------------------------
 
 class TXRXHeader(LiteXModule):
-    def __init__(self, data_width, with_csr=True):
+    def __init__(self, data_width, with_csr=True, with_rx_gain_tag=False):
         # TX.
         self.tx = TXHeaderExtractor(data_width, with_csr)
 
         # RX.
-        self.rx = RXHeaderInserter(data_width, with_csr)
+        self.rx = RXHeaderInserter(data_width, with_csr, with_gain_tag=with_rx_gain_tag)
 
         # CSR.
         if with_csr:
@@ -339,6 +589,26 @@ class TXRXHeader(LiteXModule):
                 self._tx_underflow.status.eq(self.tx.underflow),
                 self.rx.rx_offset.eq(self._rx_offset.storage),
             ]
+            # RX gain tag CSRs, appended after every pre-existing HEADER CSR for the same
+            # address-compatibility reason (presence is advertised by the capability
+            # features.rx_gain_tag bit).
+            if with_rx_gain_tag:
+                self._rx_gain_tag = CSRStorage(fields=[
+                    CSRField("enable", size=1, offset=0, reset=0, values=[
+                        ("``0b0``", "RX header word is the legacy sync word."),
+                        ("``0b1``", "RX header word is the RX gain tag (needs header_enable)."),
+                    ]),
+                ], description="RX gain tag control. Change only while the RX DMA is stopped.")
+                self._rx_gain_tag_status = CSRStatus(fields=[
+                    CSRField("active", size=1, offset=0,
+                        description="The gain-tag path is in use (enable, header_enable and a frame that fits the frame FIFO)."),
+                    CSRField("fifo_depth", size=16, offset=16, reset=self.rx.framer.fifo_depth,
+                        description="Frame FIFO depth in words: the longest frame that can be tagged."),
+                ])
+                self.comb += [
+                    self.rx.gain_tag_enable.eq(self._rx_gain_tag.fields.enable),
+                    self._rx_gain_tag_status.fields.active.eq(self.rx.gain_tag_active),
+                ]
             self.sync += [
                 # Reset.
                 If(self.tx.reset,
@@ -354,9 +624,10 @@ class TXRXHeader(LiteXModule):
                     self.last_tx_header.status.eq(self.tx.header),
                     self.last_tx_timestamp.status.eq(self.tx.timestamp),
                 ),
-                # RX Update (stamp_time: the antenna-plane value actually inserted).
+                # RX Update (header_out/stamp_out: the header word and antenna-plane stamp
+                # actually inserted).
                 If(self.rx.update,
-                    self.last_rx_header.status.eq(self.rx.header),
-                    self.last_rx_timestamp.status.eq(self.rx.stamp_time),
+                    self.last_rx_header.status.eq(self.rx.header_out),
+                    self.last_rx_timestamp.status.eq(self.rx.stamp_out),
                 )
             ]

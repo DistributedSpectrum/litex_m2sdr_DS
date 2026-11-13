@@ -59,9 +59,9 @@ enum m2sdr_error {
 
 /* libm2sdr starts its public compatibility story at v1.0.0. Keep the ABI
  * major in sync with the installed shared-library SONAME. */
-#define M2SDR_API_VERSION 0x00010100
+#define M2SDR_API_VERSION 0x00010200
 #define M2SDR_ABI_VERSION 0x00010000
-#define M2SDR_VERSION_STRING "1.1.0"
+#define M2SDR_VERSION_STRING "1.2.0"
 
 struct m2sdr_version {
     uint32_t api;
@@ -478,6 +478,11 @@ enum m2sdr_feature_flag {
     M2SDR_FEATURE_RFIC_OVERSAMPLING = 1u << CSR_CAPABILITY_FEATURES_RFIC_OVERSAMPLING_OFFSET,
 #else
     M2SDR_FEATURE_RFIC_OVERSAMPLING = 0,
+#endif
+#ifdef CSR_CAPABILITY_FEATURES_RX_GAIN_TAG_OFFSET
+    M2SDR_FEATURE_RX_GAIN_TAG = 1u << CSR_CAPABILITY_FEATURES_RX_GAIN_TAG_OFFSET,
+#else
+    M2SDR_FEATURE_RX_GAIN_TAG = 0,
 #endif
 };
 
@@ -1022,6 +1027,92 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
                               enum m2sdr_direction direction,
                               const void *buffer,
                               struct m2sdr_metadata *meta);
+
+/* RX gain tag.
+ *
+ * Gateware built with the RX gain tag (capability M2SDR_FEATURE_RX_GAIN_TAG) samples the AD9361
+ * CTRL_OUT pins with every RX sample word and, when the tag is enabled, replaces the DMA header's
+ * sync word with the RX1 full gain-table index over the frame that follows (the same idea as the
+ * bladeRF_DS per-message gain tag). A frame is one DMA buffer's payload. The 8 header bytes are:
+ *
+ *   bits [15: 0]  0x5aa5 sync          bits [30:24]  BASE: index at the frame's first word
+ *   bits [19:16]  version (1)          bits [38:32]  END0: index at the last word of chunk 0
+ *   bit  [20]     VALID                bits [46:40]  END1    bits [54:48]  END2
+ *   bit  [21]     LOCK (CTRL_OUT[7])   bits [62:56]  END3 (= the frame's last word)
+ *   bit  [22]     CHANGED (index moved inside the frame)
+ *
+ * Chunks are counted in 64-bit stream WORDS (2 SC16 samples, 4 SC8 samples, a 2T2R sample pair
+ * in SC16): with W payload words, L = max(1, W / 4) and chunk c (0..2) is words [c*L, (c+1)*L),
+ * chunk 3 the rest. m2sdr_rx_gain_tag_chunk() does this mapping from a sample position.
+ *
+ * Only RX1's index is available (one CTRL_OUT row at a time). The index is the whole gain state
+ * in the AD9361 full gain-table mode with digital gain off (the libm2sdr defaults); convert it to
+ * dB at the frame's RX frequency with m2sdr_rx_gain_index_to_db(). The legacy 0x5aa55aa55aa55aa5
+ * word decodes as version 5, so the two never collide; m2sdr_sync_rx() and
+ * m2sdr_get_buffer_metadata() accept both. */
+#define M2SDR_RX_GAIN_TAG_VERSION_1     1
+#define M2SDR_RX_GAIN_TAG_CHUNKS        4
+#define M2SDR_RX_GAIN_TAG_FLAG_VALID    (1u << 0) /* Every word carried a settled CTRL_OUT byte.  */
+#define M2SDR_RX_GAIN_TAG_FLAG_LOCK     (1u << 1) /* CTRL_OUT[7] (gain lock) at the first word.   */
+#define M2SDR_RX_GAIN_TAG_FLAG_CHANGED  (1u << 2) /* The index moved inside the frame.            */
+
+struct m2sdr_rx_gain_tag {
+    uint64_t timestamp;   /* Header timestamp (ns) of the frame's first sample.              */
+    uint32_t flags;       /* M2SDR_RX_GAIN_TAG_FLAG_*.                                        */
+    uint8_t  version;     /* M2SDR_RX_GAIN_TAG_VERSION_1.                                     */
+    uint8_t  gain_index;  /* BASE: index at the frame's first word.                           */
+    uint8_t  gain_index_min; /* Min / max over BASE and the chunk ends.                       */
+    uint8_t  gain_index_max;
+    uint8_t  chunk_gain_index[M2SDR_RX_GAIN_TAG_CHUNKS]; /* Index at the end of each chunk.    */
+};
+
+/* Decode one 16-byte DMA header. Returns 1 for a gain tag (tag filled), 0 for the legacy sync
+ * word (no tag; tag cleared), M2SDR_ERR_PARSE for anything else. */
+int m2sdr_parse_rx_gain_tag(const void *header, struct m2sdr_rx_gain_tag *tag);
+
+/* Enable or disable the tag. Enabling points the AD9361 CTRL_OUT mux at row 0x16 (RX1 gain
+ * lock + index; needs the RF layer bound) and sets the HEADER rx_gain_tag CSR. Takes effect on
+ * frames formed after the call: change it only while the RX stream is stopped. The header must
+ * also be enabled (m2sdr_set_rx_header()). M2SDR_ERR_UNSUPPORTED on gateware without the tag. */
+int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable);
+/* enabled: the CSR is set. active: the gateware is tagging (enabled + header on + frame fits). */
+int m2sdr_get_rx_gain_tag(struct m2sdr_dev *dev, bool *enabled, bool *active);
+
+/* Per-frame gain tags behind the samples of the most recent m2sdr_sync_rx() (the analogue of
+ * bladerf_get_rx_gain_tags()). Each entry describes one DMA buffer's slice of the returned
+ * block: samples [sample_offset, sample_offset + sample_count) of the block are samples
+ * [msg_sample_offset, msg_sample_offset + sample_count) of a frame of msg_samples samples.
+ * Entries tile the block in order. Frames whose header carried no tag are skipped, so a gap in
+ * the tiling means "no gain known there". *num_tags may exceed max_tags: only max_tags are
+ * copied. M2SDR_ERR_UNSUPPORTED when the tag is not enabled on this device. */
+struct m2sdr_rx_gain_tag_msg {
+    struct m2sdr_rx_gain_tag tag;
+    uint32_t sample_offset;
+    uint32_t sample_count;
+    uint32_t msg_sample_offset;
+    uint32_t msg_samples;
+};
+int m2sdr_get_rx_gain_tags(struct m2sdr_dev *dev,
+                           struct m2sdr_rx_gain_tag_msg *tags,
+                           size_t max_tags,
+                           size_t *num_tags);
+
+/* Gain tag of an RX buffer from m2sdr_get_buffer()/m2sdr_try_get_buffer() (zero-copy path).
+ * Returns 1 with tag filled, 0 when the buffer's header carries no tag (or headers are off). */
+int m2sdr_get_buffer_rx_gain_tag(struct m2sdr_dev *dev,
+                                 const void *buffer,
+                                 struct m2sdr_rx_gain_tag *tag);
+
+/* Chunk (0..3) holding sample sample_in_msg of a frame of msg_samples samples in format. */
+unsigned m2sdr_rx_gain_tag_chunk(enum m2sdr_format format, unsigned msg_samples, unsigned sample_in_msg);
+
+/* AD9361 RX gain (dB) of full gain-table index gain_index at RX LO rx_freq_hz: the same table
+ * m2sdr_set_rx_gain() programs from, so a manual gain of G dB reads back as G. Pass the LO the
+ * frame was captured at (not the LO now: a retune changes the band, and one index then means a
+ * different gain). Needs the RF layer bound. M2SDR_ERR_RANGE when the index is past the band's
+ * table (usually: CTRL_OUT is not on row 0x16). */
+int m2sdr_rx_gain_index_to_db(struct m2sdr_dev *dev, unsigned gain_index,
+                              uint64_t rx_freq_hz, int *gain_db);
 
 /* Backend notes for zero-copy submit/release:
  *

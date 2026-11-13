@@ -22,7 +22,7 @@ from litex_m2sdr.gateware.ad9361.phy              import AD9361PHY
 from litex_m2sdr.gateware.ad9361.phy_oversampling import AD9361OversamplingPHY
 from litex_m2sdr.gateware.ad9361.spi     import AD9361SPIMaster
 from litex_m2sdr.gateware.ad9361.bitmode import AD9361TXBitMode, AD9361RXBitMode
-from litex_m2sdr.gateware.ad9361.bitmode import RX_TIMESTAMP_WIDTH, rx_layout
+from litex_m2sdr.gateware.ad9361.bitmode import RX_TIMESTAMP_WIDTH, RX_GAIN_WIDTH, rx_layout
 from litex_m2sdr.gateware.ad9361.bitmode import _sign_extend
 from litex_m2sdr.gateware.ad9361.prbs    import AD9361PRBSGenerator, AD9361PRBSChecker
 from litex_m2sdr.gateware.ad9361.prbs    import AD9361PRBS1R1TGenerator, AD9361PRBS1R1TChecker
@@ -31,6 +31,41 @@ from litex_m2sdr.gateware.ad9361.agc     import (
     AGC_DEFAULT_LOW_THRESHOLD,
     AGCSaturationCount,
 )
+
+# AD9361 CTRL_OUT Sampler --------------------------------------------------------------------------
+
+class AD9361CtrlOutSampler(LiteXModule):
+    """Sample the AD9361 CTRL_OUT[7:0] pins into clock domain ``cd`` as an RX gain side field.
+
+    The pins change asynchronously to every FPGA clock. Each bit goes through its own two-flop
+    synchronizer, so a multi-bit change can land torn (bits from both values) for one cycle. The
+    settle guard only accepts a byte seen identical on two consecutive cycles, which rejects those
+    torn bytes (the same guard as bladeRF_DS ctrl_out_xfer.vhd). ``gain`` is the RX_GAIN_WIDTH side
+    field: [7:0] the last settled byte, [8] set once a first byte has settled.
+
+    With the AD9361 CTRL_OUT pointer (register 0x035) at 0x16, the byte is [6:0] the RX1 full
+    gain-table index and [7] the RX1 gain-lock flag (UG-570 Table 44).
+    """
+    def __init__(self, ctrl_out, cd="sys"):
+        assert len(ctrl_out) == 8
+        self.gain = Signal(RX_GAIN_WIDTH)
+
+        # # #
+
+        synced  = Signal(8)
+        prev    = Signal(8)
+        settled = Signal(8)
+        valid   = Signal()
+        self.specials += MultiReg(ctrl_out, synced, odomain=cd)
+        sync = getattr(self.sync, cd)
+        sync += [
+            prev.eq(synced),
+            If(synced == prev,
+                settled.eq(synced),
+                valid.eq(1),
+            ),
+        ]
+        self.comb += self.gain.eq(Cat(settled, valid))
 
 # Architecture -------------------------------------------------------------------------------------
 #
@@ -106,7 +141,8 @@ class AD9361RFIC(LiteXModule):
         with_tx_fifo = False, tx_fifo_depth = 8192,
         with_rx_fifo = False, rx_fifo_depth = 8192,
         oversampling = False,
-        with_rx_timestamp = False):
+        with_rx_timestamp = False,
+        with_rx_gain = False):
         # oversampling=True selects the 2T2R @ 122.88 MSPS PHY (phy_oversampling.py: OSERDESE2 TX,
         # per-lane RX deskew, no internal loopback) and runs the DMA-facing datapath (sink/source,
         # buffers, bitmode, CDC) at 128-bit = two (ia,qa,ib,qb) groups per word, halving the
@@ -122,7 +158,15 @@ class AD9361RFIC(LiteXModule):
         # supported with oversampling: a 64-bit counter does not close timing at 491.52 MHz.
         assert not (with_rx_timestamp and oversampling), "RX timestamps require oversampling=False."
         self.with_rx_timestamp = with_rx_timestamp
-        rx_dw_layout = rx_layout(dw, with_rx_timestamp)
+        # with_rx_gain=True adds a "gain" field to the RX stream: the AD9361 CTRL_OUT byte (RX1
+        # gain index + lock with CTRL_OUT pointer 0x16) sampled in the rfic domain and written into
+        # the RX RFIC FIFO with each valid sample word, so it stays aligned with its samples
+        # through the FIFO, CDC and bitmode (see AD9361CtrlOutSampler and the RX header gain tag).
+        # Not supported with oversampling (the 64->128 gather and the registered CDC carry data
+        # only).
+        assert not (with_rx_gain and oversampling), "RX gain tags require oversampling=False."
+        self.with_rx_gain = with_rx_gain
+        rx_dw_layout = rx_layout(dw, with_rx_timestamp, with_rx_gain)
         # Stream Endpoints -------------------------------------------------------------------------
         self.sink   = stream.Endpoint(dma_layout(dw))
         self.source = stream.Endpoint(rx_dw_layout)
@@ -281,7 +325,10 @@ class AD9361RFIC(LiteXModule):
 
         # BitMode ----------------------------------------------------------------------------------
         self.tx_bitmode = tx_bitmode = AD9361TXBitMode(data_width=dw)
-        self.rx_bitmode = rx_bitmode = AD9361RXBitMode(data_width=dw, with_timestamp=with_rx_timestamp)
+        self.rx_bitmode = rx_bitmode = AD9361RXBitMode(data_width=dw,
+            with_timestamp = with_rx_timestamp,
+            with_gain      = with_rx_gain,
+        )
         self.comb += tx_bitmode.mode.eq(self._bitmode.fields.mode)
         self.comb += rx_bitmode.mode.eq(self._bitmode.fields.mode)
 
@@ -344,6 +391,14 @@ class AD9361RFIC(LiteXModule):
             self.rx_timestamp = rx_timestamp = Signal(RX_TIMESTAMP_WIDTH)
             self.sync.rfic += rx_timestamp.eq(rx_timestamp + 1)
             self.comb += rx_rfic_fifo.sink.timestamp.eq(rx_timestamp)
+
+        # RX Gain.
+        # --------
+        # The CTRL_OUT byte sampled in the rfic domain; the FIFO stores it with each valid sample
+        # word, like the timestamp above.
+        if with_rx_gain:
+            self.ctrl_out_sampler = ctrl_out_sampler = AD9361CtrlOutSampler(rfic_pads.stat, cd="rfic")
+            self.comb += rx_rfic_fifo.sink.gain.eq(ctrl_out_sampler.gain)
 
     def add_timing_constraints(self, platform):
         """Vivado timing exceptions for the oversampling (491.52 MHz rfic_clk) datapath.

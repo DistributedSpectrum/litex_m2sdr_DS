@@ -28,7 +28,9 @@ class Capability(LiteXModule):
         # Board.
         variant, jtagbone, eth_sfp, wr_sfp,
         # RFIC.
-        rfic_oversampling=0):
+        rfic_oversampling=0,
+        # RX gain tag.
+        rx_gain_tag=0):
 
         # API Version.
         # ------------
@@ -54,6 +56,8 @@ class Capability(LiteXModule):
                 description="Hardware timed-TX gate (and its timestamp-offset CSRs) is present."),
             CSRField("rfic_oversampling", size=1, offset=9, reset=int(rfic_oversampling),
                 description="RFIC oversampling datapath (128-bit, 491.52 MHz, 2T2R@122.88) is present."),
+            CSRField("rx_gain_tag", size=1, offset=10, reset=int(rx_gain_tag),
+                description="RX header gain tag (AD9361 CTRL_OUT gain index per frame, HEADER rx_gain_tag CSRs) is present."),
             # Reserved bits for future features.
         ], description="Hardware feature presence bitfield.")
 

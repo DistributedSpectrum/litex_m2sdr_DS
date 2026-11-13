@@ -59,6 +59,12 @@ struct m2sdr_dev {
 
     int rx_configured;
     int tx_configured;
+    /* RX gain tag (m2sdr_set_rx_gain_tag) and the per-frame entries recorded by the last
+     * m2sdr_sync_rx() (m2sdr_get_rx_gain_tags). */
+    int rx_gain_tag_enable;
+    struct m2sdr_rx_gain_tag_msg *rx_gain_tags;
+    size_t rx_gain_tags_cap;
+    size_t rx_gain_tags_num;
     int rx_header_enable;
     int rx_strip_header;
     int tx_header_enable;

@@ -23,12 +23,27 @@ BFP8_PAYLOAD_WORDS   = 127
 
 RX_TIMESTAMP_WIDTH   = 64
 
-def rx_layout(data_width, with_timestamp=False):
-    # RX sample stream layout: dma_layout, plus an optional per-word rfic_clk timestamp (see
-    # AD9361RFIC with_rx_timestamp).
-    layout = [("data", data_width)]
+# RX gain side field (see AD9361RFIC with_rx_gain): the AD9361 CTRL_OUT byte sampled in the rfic
+# domain with each sample word. With CTRL_OUT pointer 0x16 it is [6:0] the RX1 full gain-table
+# index and [7] the RX1 gain-lock flag; bit 8 is set once the sampler holds a settled value.
+RX_GAIN_WIDTH        = 9
+RX_GAIN_INDEX_BITS   = 7
+RX_GAIN_LOCK_BIT     = 7
+RX_GAIN_VALID_BIT    = 8
+
+def rx_side_fields(with_timestamp=False, with_gain=False):
+    # Per-word side fields carried next to "data" on the RX sample stream, as (name, width).
+    fields = []
     if with_timestamp:
-        layout += [("timestamp", RX_TIMESTAMP_WIDTH)]
+        fields += [("timestamp", RX_TIMESTAMP_WIDTH)]
+    if with_gain:
+        fields += [("gain", RX_GAIN_WIDTH)]
+    return fields
+
+def rx_layout(data_width, with_timestamp=False, with_gain=False):
+    # RX sample stream layout: dma_layout, plus optional per-word side fields: an rfic_clk
+    # timestamp (AD9361RFIC with_rx_timestamp) and the RX gain (AD9361RFIC with_rx_gain).
+    layout = [("data", data_width)] + rx_side_fields(with_timestamp, with_gain)
     return stream.EndpointDescription(layout)
 
 def _sign_extend(data, nbits=16):
@@ -214,10 +229,12 @@ class AD9361TXBitMode64b(LiteXModule):
 # AD9361 RX BitMode (64-bit) -----------------------------------------------------------------------
 
 class AD9361RXBitMode64b(LiteXModule):
-    def __init__(self, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False):
-        self.sink   = sink   = stream.Endpoint(rx_layout(64, with_timestamp))
-        self.source = source = stream.Endpoint(rx_layout(64, with_timestamp))
+    def __init__(self, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False, with_gain=False):
+        self.sink   = sink   = stream.Endpoint(rx_layout(64, with_timestamp, with_gain))
+        self.source = source = stream.Endpoint(rx_layout(64, with_timestamp, with_gain))
         self.mode   = mode   = Signal(2)
+        side_fields = rx_side_fields(with_timestamp, with_gain)
+        side_names  = {name for name, _ in side_fields}
 
         # # #
 
@@ -228,18 +245,22 @@ class AD9361RXBitMode64b(LiteXModule):
         # 8-bit mode.
         # -----------
         self.conv = conv = stream.Converter(32, 64)
-        if with_timestamp:
-            # Each output word packs two input words: it carries the first one's timestamp.
-            # ts_first_word mirrors the converter's demux (which also restarts on last).
-            ts_first_word = Signal(reset=1)
-            ts_first      = Signal(RX_TIMESTAMP_WIDTH)
+        if side_fields:
+            # Each output word packs two input words: it carries the first one's side fields
+            # (timestamp, gain). first_word mirrors the converter's demux (which also restarts
+            # on last).
+            first_word = Signal(reset=1)
             self.sync += If(conv.sink.valid & conv.sink.ready,
-                If(ts_first_word, ts_first.eq(sink.timestamp)),
-                ts_first_word.eq(~ts_first_word | sink.last),
+                first_word.eq(~first_word | sink.last),
             )
-            self.comb += If(mode == _8_BIT_MODE, source.timestamp.eq(ts_first))
+            for name, width in side_fields:
+                held = Signal(width, name=f"{name}_first")
+                self.sync += If(conv.sink.valid & conv.sink.ready & first_word,
+                    held.eq(getattr(sink, name)),
+                )
+                self.comb += If(mode == _8_BIT_MODE, getattr(source, name).eq(held))
         self.comb += If(mode == _8_BIT_MODE,
-            sink.connect(conv.sink, omit={"data", "timestamp"}),
+            sink.connect(conv.sink, omit={"data"} | side_names),
             conv.sink.data[0*8:1*8].eq(_round_shift_12_to_8(self, sink.data[0*16:0*16+12])),
             conv.sink.data[1*8:2*8].eq(_round_shift_12_to_8(self, sink.data[1*16:1*16+12])),
             conv.sink.data[2*8:3*8].eq(_round_shift_12_to_8(self, sink.data[2*16:2*16+12])),
@@ -259,13 +280,15 @@ class AD9361RXBitMode64b(LiteXModule):
         bfp8_sequence      = Signal(8)
         bfp8_word0         = Signal(64)
 
-        # A block (header + payload) carries its first input word's timestamp. Blocks do not
-        # overlap (COLLECT only restarts after PAYLOAD), so one register is enough.
-        bfp8_timestamp_latch = []
-        if with_timestamp:
-            bfp8_timestamp = Signal(RX_TIMESTAMP_WIDTH)
-            bfp8_timestamp_latch = [If(bfp8_collect_count == 0, NextValue(bfp8_timestamp, sink.timestamp))]
-            self.comb += If(mode == _BFP8_MODE, source.timestamp.eq(bfp8_timestamp))
+        # A block (header + payload) carries its first input word's side fields (timestamp,
+        # gain). Blocks do not overlap (COLLECT only restarts after PAYLOAD), so one register
+        # per field is enough.
+        bfp8_side_latch = []
+        for name, width in side_fields:
+            held = Signal(width, name=f"bfp8_{name}")
+            bfp8_side_latch.append(
+                If(bfp8_collect_count == 0, NextValue(held, getattr(sink, name))))
+            self.comb += If(mode == _BFP8_MODE, getattr(source, name).eq(held))
 
         sample_abs = [
             _sample_abs(self, sink.data[i*16:i*16 + 12])
@@ -300,7 +323,7 @@ class AD9361RXBitMode64b(LiteXModule):
                     NextValue(bfp8_max_abs, next_max_abs),
                 ),
                 If(sink.valid & sink.ready,
-                    *bfp8_timestamp_latch,
+                    *bfp8_side_latch,
                     If(bfp8_collect_count == (bfp8_input_words - 1),
                         NextValue(bfp8_collect_count, 0),
                         NextState("BFP8_FOLD"),
@@ -463,13 +486,15 @@ class AD9361RXBitMode(LiteXModule):
     (standard datapath) or AD9361RXBitMode128b (oversampling datapath) and exposes its
     sink/source/mode directly.
     """
-    def __init__(self, data_width=64, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False):
+    def __init__(self, data_width=64, bfp8_payload_words=BFP8_PAYLOAD_WORDS, with_timestamp=False,
+        with_gain=False):
         assert data_width in [64, 128]
         if data_width == 128:
             assert not with_timestamp, "RX timestamps are not supported on the 128-bit datapath."
+            assert not with_gain, "RX gain tags are not supported on the 128-bit datapath."
             self.core = core = AD9361RXBitMode128b()
         else:
-            self.core = core = AD9361RXBitMode64b(bfp8_payload_words, with_timestamp)
+            self.core = core = AD9361RXBitMode64b(bfp8_payload_words, with_timestamp, with_gain)
         self.sink   = core.sink
         self.source = core.source
         self.mode   = core.mode

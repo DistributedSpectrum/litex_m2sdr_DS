@@ -388,6 +388,70 @@ static int test_dma_header_helper(void)
     return 0;
 }
 
+static int test_rx_gain_tag_parse(void)
+{
+    uint8_t header[16];
+    struct m2sdr_rx_gain_tag tag;
+    uint64_t word, ts = 0x0123456789abcdefULL, parsed_ts = 0;
+
+    /* Legacy sync word: no tag, still a valid header. */
+    word = 0x5aa55aa55aa55aa5ULL;
+    memcpy(header, &word, 8);
+    memcpy(header + 8, &ts, 8);
+    if (m2sdr_parse_rx_gain_tag(header, &tag) != 0)
+        return -1;
+    if (m2sdr_tool_parse_dma_header(header, &parsed_ts) != 1 || parsed_ts != ts)
+        return -1;
+
+    /* v1 tag: VALID+CHANGED, BASE 40, ends 40/41/43/42 (gateware/header.py rx_gain_tag_word). */
+    word = 0x5aa5ULL | (1ULL << 16) | (1ULL << 20) | (1ULL << 22) | (40ULL << 24) |
+           (40ULL << 32) | (41ULL << 40) | (43ULL << 48) | (42ULL << 56);
+    memcpy(header, &word, 8);
+    if (m2sdr_parse_rx_gain_tag(header, &tag) != 1)
+        return -1;
+    if (tag.timestamp != ts || tag.version != M2SDR_RX_GAIN_TAG_VERSION_1)
+        return -1;
+    if (tag.flags != (M2SDR_RX_GAIN_TAG_FLAG_VALID | M2SDR_RX_GAIN_TAG_FLAG_CHANGED))
+        return -1;
+    if (tag.gain_index != 40 || tag.gain_index_min != 40 || tag.gain_index_max != 43)
+        return -1;
+    if (tag.chunk_gain_index[0] != 40 || tag.chunk_gain_index[1] != 41 ||
+        tag.chunk_gain_index[2] != 43 || tag.chunk_gain_index[3] != 42)
+        return -1;
+    parsed_ts = 0;
+    if (m2sdr_tool_parse_dma_header(header, &parsed_ts) != 1 || parsed_ts != ts)
+        return -1;
+
+    /* Anything else is not a header. */
+    word ^= 0xffULL;
+    memcpy(header, &word, 8);
+    if (m2sdr_parse_rx_gain_tag(header, &tag) != M2SDR_ERR_PARSE)
+        return -1;
+    return 0;
+}
+
+static int test_rx_gain_tag_chunk(void)
+{
+    /* SC16, 1022 payload words = 2044 samples: L = 255 words = 510 samples. */
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 0) != 0)
+        return -1;
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 509) != 0)
+        return -1;
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 510) != 1)
+        return -1;
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 1530) != 3)
+        return -1;
+    /* The last chunk takes the remainder (words 765..1021). */
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 2043) != 3)
+        return -1;
+    /* SC8: 4 samples per word, same word boundaries. */
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1019) != 0)
+        return -1;
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1020) != 1)
+        return -1;
+    return 0;
+}
+
 static int test_stream_direction_validation(void)
 {
     struct m2sdr_dev dev;
@@ -675,6 +739,14 @@ int main(void)
     }
     if (test_dma_header_helper() != 0) {
         fprintf(stderr, "test_dma_header_helper failed\n");
+        return 1;
+    }
+    if (test_rx_gain_tag_parse() != 0) {
+        fprintf(stderr, "test_rx_gain_tag_parse failed\n");
+        return 1;
+    }
+    if (test_rx_gain_tag_chunk() != 0) {
+        fprintf(stderr, "test_rx_gain_tag_chunk failed\n");
         return 1;
     }
     if (test_stream_direction_validation() != 0) {

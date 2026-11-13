@@ -15,12 +15,18 @@ from litepcie.common import dma_layout
 # TX/RX Loopback ----------------------------------------------------------------------------------
 
 class TXRXLoopback(LiteXModule):
-    def __init__(self, data_width=64, with_csr=True):
+    def __init__(self, data_width=64, with_csr=True, rx_description=None):
+        # rx_description: RX stream layout when it carries side fields next to "data" (e.g. the
+        # per-word RX gain, see bitmode.rx_layout); defaults to dma_layout. In loopback mode the
+        # TX stream has no side fields, so they read 0 on rx_source (a gain field of 0 is "not
+        # valid", which makes the RX header gain tag report no gain).
         assert data_width in [64, 128]
+        if rx_description is None:
+            rx_description = dma_layout(data_width)
         self.tx_sink   = tx_sink   = stream.Endpoint(dma_layout(data_width)) # i
         self.tx_source = tx_source = stream.Endpoint(dma_layout(data_width)) # o
-        self.rx_sink   = rx_sink   = stream.Endpoint(dma_layout(data_width)) # i
-        self.rx_source = rx_source = stream.Endpoint(dma_layout(data_width)) # o
+        self.rx_sink   = rx_sink   = stream.Endpoint(rx_description)         # i
+        self.rx_source = rx_source = stream.Endpoint(rx_description)         # o
 
         self.enable = Signal() # i (CSR).
 

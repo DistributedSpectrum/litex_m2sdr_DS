@@ -2774,3 +2774,115 @@ int m2sdr_rf_calibrate_interface_delay(struct m2sdr_dev *dev)
 
     return m2sdr_calibrate_interface_delay(dev, phy);
 }
+
+/* RX gain tag ------------------------------------------------------------------------------------*/
+
+/* AD9361 CTRL_OUT row 0x16: CTRL_OUT[7] = RX1 gain lock, CTRL_OUT[6:0] = RX1 full gain-table
+ * index (UG-570 Table 44). The FPGA samples these pins for the RX header gain tag. */
+#define M2SDR_CTRL_OUT_ROW_RX1_GAIN 0x16
+#define M2SDR_CTRL_OUT_ENABLE_ALL   0xff
+
+static int m2sdr_rx_gain_tag_supported(struct m2sdr_dev *dev)
+{
+#if defined(CSR_HEADER_RX_GAIN_TAG_ADDR) && defined(CSR_CAPABILITY_FEATURES_RX_GAIN_TAG_OFFSET)
+    uint32_t features = 0;
+    if (m2sdr_reg_read(dev, CSR_CAPABILITY_FEATURES_ADDR, &features) != 0)
+        return M2SDR_ERR_IO;
+    return (features >> CSR_CAPABILITY_FEATURES_RX_GAIN_TAG_OFFSET) & 1u ? 1 : 0;
+#else
+    (void)dev;
+    return 0;
+#endif
+}
+
+int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    int supported = m2sdr_rx_gain_tag_supported(dev);
+    if (supported < 0)
+        return supported;
+    if (!supported)
+        return enable ? M2SDR_ERR_UNSUPPORTED : M2SDR_ERR_OK;
+#if defined(CSR_HEADER_RX_GAIN_TAG_ADDR)
+    if (enable) {
+        /* The default init params already select row 0x16; write it again so a phy brought up
+         * with other params (or a CTRL_OUT change since) still tags the RX1 gain. */
+        struct ad9361_rf_phy *phy;
+        int rc = m2sdr_require_phy(dev, &phy);
+        if (rc != M2SDR_ERR_OK)
+            return rc;
+        if (ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_POINTER, M2SDR_CTRL_OUT_ROW_RX1_GAIN) < 0 ||
+            ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_ENABLE, M2SDR_CTRL_OUT_ENABLE_ALL) < 0)
+            return M2SDR_ERR_IO;
+        phy->pdata->ctrl_outs_ctrl.index   = M2SDR_CTRL_OUT_ROW_RX1_GAIN;
+        phy->pdata->ctrl_outs_ctrl.en_mask = M2SDR_CTRL_OUT_ENABLE_ALL;
+    }
+    if (m2sdr_reg_write(dev, CSR_HEADER_RX_GAIN_TAG_ADDR,
+                        (enable ? 1u : 0u) << CSR_HEADER_RX_GAIN_TAG_ENABLE_OFFSET) != 0)
+        return M2SDR_ERR_IO;
+    dev->rx_gain_tag_enable = enable ? 1 : 0;
+    dev->rx_gain_tags_num   = 0;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_rx_gain_tag(struct m2sdr_dev *dev, bool *enabled, bool *active)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    if (enabled)
+        *enabled = false;
+    if (active)
+        *active = false;
+    int supported = m2sdr_rx_gain_tag_supported(dev);
+    if (supported < 0)
+        return supported;
+    if (!supported)
+        return M2SDR_ERR_UNSUPPORTED;
+#if defined(CSR_HEADER_RX_GAIN_TAG_ADDR) && defined(CSR_HEADER_RX_GAIN_TAG_STATUS_ADDR)
+    uint32_t ctl = 0, status = 0;
+    if (m2sdr_reg_read(dev, CSR_HEADER_RX_GAIN_TAG_ADDR, &ctl) != 0 ||
+        m2sdr_reg_read(dev, CSR_HEADER_RX_GAIN_TAG_STATUS_ADDR, &status) != 0)
+        return M2SDR_ERR_IO;
+    if (enabled)
+        *enabled = (ctl >> CSR_HEADER_RX_GAIN_TAG_ENABLE_OFFSET) & 1u;
+    if (active)
+        *active = (status >> CSR_HEADER_RX_GAIN_TAG_STATUS_ACTIVE_OFFSET) & 1u;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_rx_gain_index_to_db(struct m2sdr_dev *dev, unsigned gain_index,
+                              uint64_t rx_freq_hz, int *gain_db)
+{
+    struct ad9361_rf_phy *phy;
+    int rc;
+
+    if (!dev || !gain_db)
+        return M2SDR_ERR_INVAL;
+    rc = m2sdr_require_phy(dev, &phy);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+    if (!phy->gt_info || !phy->pdata)
+        return M2SDR_ERR_STATE;
+
+    /* Same band choice as the driver's ad9361_gt_tableindex(), but at the stated frequency
+     * rather than the current LO. */
+    for (unsigned i = 0; phy->gt_info[i].tab != NULL; i++) {
+        const struct gain_table_info *gt = &phy->gt_info[i];
+        if (gt->split_table != phy->pdata->split_gt)
+            continue;
+        if (!(gt->start < rx_freq_hz && rx_freq_hz <= gt->end))
+            continue;
+        if (gain_index >= gt->max_index)
+            return M2SDR_ERR_RANGE;
+        *gain_db = gt->abs_gain_tbl[gain_index];
+        return M2SDR_ERR_OK;
+    }
+    return M2SDR_ERR_RANGE;
+}

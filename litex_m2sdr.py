@@ -53,6 +53,7 @@ from litex_m2sdr.gateware.capability       import Capability
 from litex_m2sdr.gateware.clock_discipline import MMCMPhaseDiscipline, PTPClock10Discipline
 from litex_m2sdr.gateware.si5351           import SI5351
 from litex_m2sdr.gateware.ad9361.core import AD9361RFIC
+from litex_m2sdr.gateware.ad9361.bitmode import rx_layout
 from litex_m2sdr.gateware.qpll        import SharedQPLL
 from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
 from litex_m2sdr.gateware.ptp_discipline import PTPTimeDiscipline, TimeDisciplineCDC
@@ -337,12 +338,20 @@ class BaseSoC(SoCMini):
         pps_input              = "m2",
         with_rfic_oversampling = False,
         with_rfic_rx_timestamp = False,
+        with_rx_gain_tag       = True,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
 
         if with_pcie_ptm and not with_pcie:
             raise ValueError("PCIe PTM requires PCIe to be enabled")
+
+        # The RX gain tag rides the 64-bit RX datapath; the oversampling (128-bit) datapath does
+        # not carry the per-word gain field, so it is dropped there rather than failing the build.
+        if with_rx_gain_tag and with_rfic_oversampling:
+            print("RX gain tag is not supported with --with-rfic-oversampling: disabled.")
+            with_rx_gain_tag = False
+        self.with_rx_gain_tag = with_rx_gain_tag
 
         # The kernel driver's DMA ring depth (DMA_BUFFER_COUNT) must be a power of two.
         if not (2 <= pcie_dma_table_depth <= 65536) or (pcie_dma_table_depth & (pcie_dma_table_depth - 1)):
@@ -455,6 +464,7 @@ class BaseSoC(SoCMini):
 
             # RFIC.
             rfic_oversampling = with_rfic_oversampling,
+            rx_gain_tag       = with_rx_gain_tag,
 
             # Board.
             variant        = variant,
@@ -894,13 +904,18 @@ class BaseSoC(SoCMini):
             oversampling   = with_rfic_oversampling,
             # Per-word rfic_clk timestamp on the RX stream handed to add_rfic_datapath().
             with_rx_timestamp = with_rfic_rx_timestamp,
+            # Per-word AD9361 CTRL_OUT gain byte, consumed by the RX header gain tag.
+            with_rx_gain      = with_rx_gain_tag,
         )
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
 
         # TX/RX Header Extracter/Inserter ----------------------------------------------------------
 
-        self.header = TXRXHeader(data_width=128 if with_rfic_oversampling else 64)
+        self.header = TXRXHeader(
+            data_width       = 128 if with_rfic_oversampling else 64,
+            with_rx_gain_tag = with_rx_gain_tag,
+        )
         # Timed-TX gate: feed the FPGA time so the TX header extractor holds each frame until
         # its air-time (header timestamp) and drops too-late frames (see gateware/header.py).
         self.comb += self.header.tx.time.eq(self.time_gen.time)
@@ -914,7 +929,11 @@ class BaseSoC(SoCMini):
 
         # AD9361 <-> [User Processing] <-> Loopback <-> Header.
         # ------------------------------------------------------
-        self.txrx_loopback = TXRXLoopback(data_width=128 if with_rfic_oversampling else 64, with_csr=True)
+        self.txrx_loopback = TXRXLoopback(
+            data_width     = 128 if with_rfic_oversampling else 64,
+            with_csr       = True,
+            rx_description = rx_layout(64, with_gain=True) if with_rx_gain_tag else None,
+        )
 
         # Header TX -> Loopback.
         self.comb += self.header.tx.source.connect(self.txrx_loopback.tx_sink)
@@ -1346,6 +1365,11 @@ class BaseSoC(SoCMini):
         - Sample time: with ``with_rfic_rx_timestamp=True``, ``rfic_source`` also carries a
           64-bit ``timestamp`` per word, the rfic_clk cycle count at which the word entered the
           RX RFIC FIFO (see AD9361RFIC). ``rx_sink`` has no such field: omit it when connecting.
+        - RX gain: with ``with_rx_gain_tag=True`` (the default), ``rfic_source`` and ``rx_sink``
+          both carry a 9-bit ``gain`` field per word (the AD9361 CTRL_OUT byte, see
+          AD9361CtrlOutSampler) that the RX header turns into the per-frame gain tag. Processing
+          that changes the word rate should drive ``rx_sink.gain`` with the gain of the input
+          words it consumed; leaving it 0 makes every tag report "no valid gain".
 
         Generic DSP building blocks (DDS/NCO, mixers, CIC, FIR, ...) for use here are being
         gathered in LiteDSP: https://github.com/enjoy-digital/litedsp.
@@ -1754,6 +1778,8 @@ def main():
 
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
+    parser.add_argument("--with-rx-gain-tag", action=argparse.BooleanOptionalAction, default=True,
+        help="Tag each RX DMA header with the AD9361 RX1 gain index over its frame (default on; not with --with-rfic-oversampling).")
 
     # PCIe parameters.
     parser.add_argument("--with-pcie",       action="store_true", help="Enable PCIe Communication.")
@@ -1861,6 +1887,7 @@ def main():
 
         # RFIC.
         with_rfic_oversampling = args.with_rfic_oversampling,
+        with_rx_gain_tag       = args.with_rx_gain_tag,
 
         # PCIe.
         with_pcie     = args.with_pcie,
@@ -1963,6 +1990,8 @@ def main():
                 r += f"_{args.wr_cpu_boot}"
         if args.with_rfic_oversampling:
             r += "_rfic_oversampling"
+        if not args.with_rx_gain_tag:
+            r += "_no_rx_gain_tag"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r
