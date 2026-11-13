@@ -39,9 +39,12 @@ class TimeGenerator(LiteXModule):
         self.discipline_adjust_sign = Signal()
         self.discipline_adjustment  = Signal(64)
 
-        # Time Sync Interface.
-        self.time_sync    = Signal()
-        self.time_seconds = Signal(40)
+        # Time Sync Interface (time domain): on time_sync (with sync_enable), time becomes
+        # (time_seconds + 1) * 1e9 + time_sync_offset ns. time_sync_offset compensates the latency
+        # between the PPS edge and the pulse (see gateware/gps.py); 0 keeps the original behavior.
+        self.time_sync        = Signal()
+        self.time_seconds     = Signal(40)
+        self.time_sync_offset = Signal(32)
 
         # # #
 
@@ -76,7 +79,7 @@ class TimeGenerator(LiteXModule):
                 frac.eq(0),
             # Time Sync.
             ).Elif(self.sync_enable & self.time_sync,
-                time.eq(((self.time_seconds + 1) * int(1e9))),
+                time.eq(((self.time_seconds + 1) * int(1e9)) + self.time_sync_offset),
                 frac.eq(0),
             # External phase trim.
             ).Elif(self.discipline_adjust,

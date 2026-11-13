@@ -59,6 +59,7 @@ from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
 from litex_m2sdr.gateware.ptp_discipline import PTPTimeDiscipline, TimeDisciplineCDC
 from litex_m2sdr.gateware.ptp_identity   import PTPIdentityTracker
 from litex_m2sdr.gateware.pps         import PPSGenerator, PPSInput
+from litex_m2sdr.gateware.gps         import GPSTime
 from litex_m2sdr.gateware.pcie        import (
     PCIeLinkResetWorkaround,
     LitePCIeWishboneBurstReadSlave,
@@ -279,6 +280,7 @@ class BaseSoC(SoCMini):
 
         # Time.
         "time_gen"         : 17,
+        "gps"              : 48,
 
         # PCIe.
         "pcie_phy"         : 10,
@@ -337,6 +339,7 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         pps_input              = "m2",
         pps_forward            = None,
+        with_gps               = False, gps_baudrate=115200,
         with_rfic_oversampling = False,
         with_rfic_rx_timestamp = False,
         with_rx_gain_tag       = True,
@@ -471,6 +474,9 @@ class BaseSoC(SoCMini):
             rfic_oversampling = with_rfic_oversampling,
             rx_gain_tag       = with_rx_gain_tag,
 
+            # GPS time input.
+            gps               = with_gps,
+
             # Board.
             variant        = variant,
             jtagbone       = with_jtagbone,
@@ -524,6 +530,19 @@ class BaseSoC(SoCMini):
         # the input pad: IBUF -> OBUF, a few ns and no clock quantization.
         if pps_forward is not None:
             self.comb += platform.request(f"pps_out_{pps_forward}").eq(pps_pad)
+
+        # GPS Time ---------------------------------------------------------------------------------
+
+        # GPS UART (UBX-NAV-TIMEUTC) + qualified PPS -> board time in UTC (see gateware/gps.py). The
+        # PPS is the same pad as pps_in; the UART is on the M.2 breakout's Synchro_GPIO2/3.
+        if with_gps:
+            self.gps = GPSTime(
+                uart_pads    = platform.request("gps_uart"),
+                pps_pad      = pps_pad,
+                time_gen     = self.time_gen,
+                sys_clk_freq = sys_clk_freq,
+                baudrate     = gps_baudrate,
+            )
 
         self.pps_gen = PPSGenerator(
             clk_freq = sys_clk_freq,
@@ -1828,6 +1847,9 @@ def main():
     parser.add_argument("--with-gpio",       action="store_true",     help="Enable GPIO support.")
     parser.add_argument("--pps-input", default="m2", choices=["m2", "tp1", "tp2"],
         help="PPS input pin (M.2 PPS_IN, TP1, or TP2).")
+    parser.add_argument("--with-gps", action="store_true",
+        help="GPS time input: UBX-NAV-TIMEUTC on the M.2 breakout UART (Synchro_GPIO2/3) + the PPS input sync the board time to UTC.")
+    parser.add_argument("--gps-baudrate", default=115200, type=int, help="GPS UART baud rate at reset (CSR-adjustable).")
     parser.add_argument("--pps-forward", default=None, choices=["m2"],
         help="Forward the PPS input to M.2 PPS_OUT (pin 24), e.g. to a host PPS GPIO.")
 
@@ -1939,6 +1961,8 @@ def main():
         with_gpio     = args.with_gpio,
         pps_input     = args.pps_input,
         pps_forward   = args.pps_forward,
+        with_gps      = args.with_gps,
+        gps_baudrate  = args.gps_baudrate,
         with_jtagbone = not args.without_jtagbone,
 
         # White Rabbit.
@@ -2011,6 +2035,8 @@ def main():
             r += "_rfic_oversampling"
         if not args.with_rx_gain_tag:
             r += "_no_rx_gain_tag"
+        if args.with_gps:
+            r += "_gps"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r

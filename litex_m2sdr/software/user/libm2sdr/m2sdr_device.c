@@ -1839,6 +1839,190 @@ int m2sdr_set_time(struct m2sdr_dev *dev, uint64_t time_ns)
     return M2SDR_ERR_OK;
 }
 
+/* GPS time input ---------------------------------------------------------------------------------*/
+
+static int m2sdr_gps_supported(struct m2sdr_dev *dev)
+{
+#if defined(CSR_GPS_BASE) && defined(CSR_CAPABILITY_FEATURES_GPS_OFFSET)
+    uint32_t features = 0;
+    if (m2sdr_reg_read(dev, CSR_CAPABILITY_FEATURES_ADDR, &features) != 0)
+        return M2SDR_ERR_IO;
+    return (features >> CSR_CAPABILITY_FEATURES_GPS_OFFSET) & 1u ? 1 : 0;
+#else
+    (void)dev;
+    return 0;
+#endif
+}
+
+#define M2SDR_GPS_REQUIRE(dev)                         \
+    do {                                               \
+        int _s;                                        \
+        if (!(dev))                                    \
+            return M2SDR_ERR_INVAL;                    \
+        _s = m2sdr_gps_supported(dev);                 \
+        if (_s < 0)                                    \
+            return _s;                                 \
+        if (!_s)                                       \
+            return M2SDR_ERR_UNSUPPORTED;              \
+    } while (0)
+
+#if defined(CSR_GPS_BASE)
+#define M2SDR_GPS_BIT(word, reg, field) \
+    (((word) >> CSR_GPS_##reg##_##field##_OFFSET) & 1u)
+#endif
+
+int m2sdr_gps_get_status(struct m2sdr_dev *dev, struct m2sdr_gps_status *status)
+{
+    M2SDR_GPS_REQUIRE(dev);
+    if (!status)
+        return M2SDR_ERR_INVAL;
+#if defined(CSR_GPS_BASE)
+    uint32_t st = 0, ctl = 0, tctl = 0, tw = 0, sysclk = 0, v = 0;
+    uint64_t v64 = 0;
+
+    memset(status, 0, sizeof(*status));
+    if (m2sdr_reg_read(dev, CSR_GPS_STATUS_ADDR, &st) != 0 ||
+        m2sdr_reg_read(dev, CSR_GPS_CONTROL_ADDR, &ctl) != 0 ||
+        m2sdr_reg_read(dev, CSR_TIME_GEN_CONTROL_ADDR, &tctl) != 0 ||
+        m2sdr_reg_read(dev, CSR_GPS_TUNING_WORD_ADDR, &tw) != 0 ||
+        m2sdr_reg_read(dev, CSR_GPS_SYS_CLK_FREQ_ADDR, &sysclk) != 0)
+        return M2SDR_ERR_IO;
+    status->utc_valid  = M2SDR_GPS_BIT(st, STATUS, UTC_VALID);
+    status->utc_fresh  = M2SDR_GPS_BIT(st, STATUS, UTC_FRESH);
+    status->pps_alive  = M2SDR_GPS_BIT(st, STATUS, PPS_ALIVE);
+    status->pending    = M2SDR_GPS_BIT(st, STATUS, PENDING);
+    status->synced     = M2SDR_GPS_BIT(st, STATUS, SYNCED);
+    status->once_armed = M2SDR_GPS_BIT(st, STATUS, ONCE_ARMED);
+    status->sync_every = M2SDR_GPS_BIT(ctl, CONTROL, SYNC_EVERY);
+    status->time_sync_enable = (tctl >> CSR_TIME_GEN_CONTROL_SYNC_ENABLE_OFFSET) & 1u;
+    status->baudrate   = (uint32_t)(((uint64_t)tw * sysclk + (1ull << 31)) >> 32);
+
+    if (m2sdr_read_reg_u64(dev, CSR_GPS_EPOCH_ADDR, &v64) != 0) return M2SDR_ERR_IO;
+    status->epoch = v64;
+    if (m2sdr_read_reg_u64(dev, CSR_GPS_PPS_TIME_ADDR, &v64) != 0) return M2SDR_ERR_IO;
+    status->pps_time_ns = v64;
+    if (m2sdr_read_reg_u64(dev, CSR_GPS_SYNC_EPOCH_ADDR, &v64) != 0) return M2SDR_ERR_IO;
+    status->sync_epoch = v64;
+
+#define M2SDR_GPS_READ32(addr, dst)                         \
+    do {                                                    \
+        if (m2sdr_reg_read(dev, (addr), &v) != 0)           \
+            return M2SDR_ERR_IO;                            \
+        (dst) = v;                                          \
+    } while (0)
+    M2SDR_GPS_READ32(CSR_GPS_T_ACC_ADDR,        status->t_acc_ns);
+    M2SDR_GPS_READ32(CSR_GPS_NANO_ADDR,         v); status->nano_ns = (int32_t)v;
+    M2SDR_GPS_READ32(CSR_GPS_SYNC_OFFSET_ADDR,  status->sync_offset_ns);
+    M2SDR_GPS_READ32(CSR_GPS_MSG_COUNT_ADDR,    status->msg_count);
+    M2SDR_GPS_READ32(CSR_GPS_CK_ERRORS_ADDR,    status->ck_errors);
+    M2SDR_GPS_READ32(CSR_GPS_PPS_COUNT_ADDR,    status->pps_count);
+    M2SDR_GPS_READ32(CSR_GPS_PPS_REJECTED_ADDR, status->pps_rejected);
+    M2SDR_GPS_READ32(CSR_GPS_SYNC_COUNT_ADDR,   status->sync_count);
+    M2SDR_GPS_READ32(CSR_GPS_PPS_NO_UTC_ADDR,   status->pps_no_utc);
+#undef M2SDR_GPS_READ32
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_gps_set_sync(struct m2sdr_dev *dev, enum m2sdr_gps_sync_mode mode)
+{
+    M2SDR_GPS_REQUIRE(dev);
+#if defined(CSR_GPS_BASE)
+    uint32_t ctl = 0, tctl = 0;
+    bool ptp_owned = false;
+    int ret;
+
+    if (mode != M2SDR_GPS_SYNC_OFF && mode != M2SDR_GPS_SYNC_EVERY_PPS && mode != M2SDR_GPS_SYNC_ONCE)
+        return M2SDR_ERR_INVAL;
+    if (mode != M2SDR_GPS_SYNC_OFF) {
+        ret = m2sdr_time_owned_by_ptp(dev, &ptp_owned);
+        if (ret != M2SDR_ERR_OK)
+            return ret;
+        if (ptp_owned)
+            return M2SDR_ERR_STATE;
+    }
+    if (m2sdr_reg_read(dev, CSR_GPS_CONTROL_ADDR, &ctl) != 0 ||
+        m2sdr_reg_read(dev, CSR_TIME_GEN_CONTROL_ADDR, &tctl) != 0)
+        return M2SDR_ERR_IO;
+
+    /* Time generator: keep enable, never re-issue its read/write pulses, set sync_enable. */
+    tctl &= ~((1u << CSR_TIME_GEN_CONTROL_READ_OFFSET) | (1u << CSR_TIME_GEN_CONTROL_WRITE_OFFSET));
+    if (mode == M2SDR_GPS_SYNC_OFF)
+        tctl &= ~(1u << CSR_TIME_GEN_CONTROL_SYNC_ENABLE_OFFSET);
+    else
+        tctl |= (1u << CSR_TIME_GEN_CONTROL_SYNC_ENABLE_OFFSET);
+    if (m2sdr_reg_write(dev, CSR_TIME_GEN_CONTROL_ADDR, tctl) != 0)
+        return M2SDR_ERR_IO;
+
+    ctl &= ~((1u << CSR_GPS_CONTROL_SYNC_EVERY_OFFSET) | (1u << CSR_GPS_CONTROL_SYNC_ONCE_OFFSET) |
+             (1u << CSR_GPS_CONTROL_CLEAR_OFFSET));
+    ctl |= (1u << CSR_GPS_CONTROL_ENABLE_OFFSET);
+    if (mode == M2SDR_GPS_SYNC_EVERY_PPS)
+        ctl |= (1u << CSR_GPS_CONTROL_SYNC_EVERY_OFFSET);
+    if (mode == M2SDR_GPS_SYNC_ONCE)
+        ctl |= (1u << CSR_GPS_CONTROL_SYNC_ONCE_OFFSET); /* Pulse field: arms one sync. */
+    if (m2sdr_reg_write(dev, CSR_GPS_CONTROL_ADDR, ctl) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)mode;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_gps_set_baudrate(struct m2sdr_dev *dev, uint32_t baudrate)
+{
+    M2SDR_GPS_REQUIRE(dev);
+#if defined(CSR_GPS_BASE)
+    uint32_t sysclk = 0;
+    if (baudrate == 0)
+        return M2SDR_ERR_RANGE;
+    if (m2sdr_reg_read(dev, CSR_GPS_SYS_CLK_FREQ_ADDR, &sysclk) != 0)
+        return M2SDR_ERR_IO;
+    /* The UART samples at the sys clock: keep at least 8 samples per bit. */
+    if (sysclk == 0 || (uint64_t)baudrate * 8u > sysclk)
+        return M2SDR_ERR_RANGE;
+    uint32_t tw = (uint32_t)((((uint64_t)baudrate << 32) + sysclk / 2) / sysclk);
+    if (m2sdr_reg_write(dev, CSR_GPS_TUNING_WORD_ADDR, tw) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)baudrate;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_gps_set_sync_offset(struct m2sdr_dev *dev, uint32_t offset_ns)
+{
+    M2SDR_GPS_REQUIRE(dev);
+#if defined(CSR_GPS_BASE)
+    if (m2sdr_reg_write(dev, CSR_GPS_SYNC_OFFSET_ADDR, offset_ns) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)offset_ns;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_gps_clear_counters(struct m2sdr_dev *dev)
+{
+    M2SDR_GPS_REQUIRE(dev);
+#if defined(CSR_GPS_BASE)
+    uint32_t ctl = 0;
+    if (m2sdr_reg_read(dev, CSR_GPS_CONTROL_ADDR, &ctl) != 0)
+        return M2SDR_ERR_IO;
+    ctl &= ~(1u << CSR_GPS_CONTROL_SYNC_ONCE_OFFSET);
+    if (m2sdr_reg_write(dev, CSR_GPS_CONTROL_ADDR, ctl | (1u << CSR_GPS_CONTROL_CLEAR_OFFSET)) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
 /* Read the 64-bit FPGA DNA value used as the stable board serial source. */
 int m2sdr_get_fpga_dna(struct m2sdr_dev *dev, uint64_t *dna)
 {

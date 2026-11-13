@@ -61,6 +61,18 @@ Each rising edge also latches the board time into the `pps_in_time` CSR (ns). Wi
 ./litex_m2sdr.py --pps-input=m2  --pps-forward=m2  --with-rfic-rx-timestamp --build # M.2 pin 22 in, pin 24 out.
 ```
 
+## GPS Time Input (M.2 Breakout)
+
+The M.2 breakout carries a Gateworks GW16143 (u-blox ZED-F9P) to the SDR: GPS UART1 TX on `Synchro_GPIO2` (M.2 pin 30, `A18`), GPS RX on `Synchro_GPIO3` (pin 32, `A21`), and the timepulse on `PPS_IN` (pin 22, `K18`). All are 3.3V.
+
+`--with-gps` adds the GPS time core (`gateware/gps.py`). It decodes UBX-NAV-TIMEUTC (Fletcher checksum, validUTC flag) into a UTC second, qualifies the PPS (8-cycle glitch filter, 0.9 s refractory window after each accepted edge), and can load the board time with `(S + 1) * 1e9 + sync_offset` ns on the PPS that starts second `S + 1`. RX header timestamps and timed TX then run on GPS UTC. It is off by default because pins 28 to 36 are only safe to drive with the breakout fitted.
+
+```sh
+./litex_m2sdr.py --variant=m2 --with-pcie --pcie-lanes=4 --with-gps --pps-forward=m2 --build
+```
+
+Provision the F9P over its USB port first: NAV-TIMEUTC on UART1 at 115200 baud (the gateware default, `m2sdr_gps_set_baudrate()` changes it) and the timepulse on the UTC top of the second. Software control is in libm2sdr: `m2sdr_gps_get_status()`, `m2sdr_gps_set_sync()` (off, every PPS, or once), `m2sdr_gps_set_sync_offset()`. `pps_time_ns` (board time latched on every qualified PPS, before any sync) measures the board clock against GPS; `m2sdr_set_refclk_ppm()` trims it.
+
 ## User LED Behavior
 
 The board exposes a single monochrome `user_led`, so the gateware uses it as a layered status indicator rather than a simple on/off flag:

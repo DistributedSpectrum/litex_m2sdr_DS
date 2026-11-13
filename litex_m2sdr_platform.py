@@ -132,6 +132,13 @@ _io = [
     ("pps_in_tp1", 0, Pins("E22"), IOStandard("LVCMOS33")), # TP1 / Bank16 / 3.3V.
     ("pps_in_tp2", 0, Pins("D22"), IOStandard("LVCMOS33")), # TP2 / Bank16 / 3.3V.
     ("pps_out_m2",  0, Pins("M2:NC24"), IOStandard("LVCMOS33")), # M.2 pin 24 / PPS_OUT.
+
+    # GPS UART on the M.2 breakout (J7, GW16143 UART1): GPS TX -> FPGA rx, FPGA tx -> GPS RX.
+    ("gps_uart", 0,
+        Subsignal("rx", Pins("M2:NC30")), # M.2 pin 30 / Synchro_GPIO2 / A18.
+        Subsignal("tx", Pins("M2:NC32")), # M.2 pin 32 / Synchro_GPIO3 / A21.
+        IOStandard("LVCMOS33"),
+    ),
 ]
 
 _io_baseboard = [ # Note: These IOs are only available when the board is plugged in Acorn Baseboard Mini.

@@ -484,6 +484,11 @@ enum m2sdr_feature_flag {
 #else
     M2SDR_FEATURE_RX_GAIN_TAG = 0,
 #endif
+#ifdef CSR_CAPABILITY_FEATURES_GPS_OFFSET
+    M2SDR_FEATURE_GPS = 1u << CSR_CAPABILITY_FEATURES_GPS_OFFSET,
+#else
+    M2SDR_FEATURE_GPS = 0,
+#endif
 };
 
 enum m2sdr_feature_mask {
@@ -732,6 +737,60 @@ int  m2sdr_gpio_read(struct m2sdr_dev *dev, uint8_t *value);
 /* Time */
 int  m2sdr_get_time(struct m2sdr_dev *dev, uint64_t *time_ns);
 int  m2sdr_set_time(struct m2sdr_dev *dev, uint64_t time_ns);
+
+/* GPS time input (gateware built with --with-gps, capability M2SDR_FEATURE_GPS).
+ *
+ * A u-blox receiver (Gateworks GW16143 ZED-F9P on the M.2 breakout) sends UBX-NAV-TIMEUTC on its
+ * UART1 to the FPGA (Synchro_GPIO2/3) and its timepulse to PPS_IN. The gateware decodes the UTC
+ * second, qualifies the PPS (glitch filter + 0.9 s refractory window), and can load the board time
+ * with (S + 1) * 1e9 + sync_offset ns on the PPS that starts second S + 1. RX header timestamps,
+ * m2sdr_get_time() and timed TX then all run on GPS UTC (ns since 1970), with no host clock in the
+ * path. The F9P must be provisioned (over its USB port) to output NAV-TIMEUTC on UART1 at the
+ * gateware baud (115200 by default) with its timepulse on the UTC top of the second.
+ *
+ * Between syncs the board time runs on the SI5351-derived 100 MHz clock: pps_time_ns, latched on
+ * every qualified PPS before any sync, measures that clock against GPS. While syncing every PPS,
+ * pps_time_ns - (sync_epoch + 1) * 1e9 - sync_offset_ns is the error the second accumulated (the
+ * size of the step the sync applied); m2sdr_set_refclk_ppm() trims the SI5351 (and with it the
+ * AD9361 sample clock) to drive it toward zero. */
+enum m2sdr_gps_sync_mode {
+    M2SDR_GPS_SYNC_OFF       = 0, /* Decode and monitor only; the board time is not touched. */
+    M2SDR_GPS_SYNC_EVERY_PPS = 1, /* Load the board time on every qualified PPS with fresh UTC. */
+    M2SDR_GPS_SYNC_ONCE      = 2, /* Load it on the next such PPS, then free-run.               */
+};
+
+struct m2sdr_gps_status {
+    bool     utc_valid;       /* Last good NAV-TIMEUTC had validUTC and in-range fields.     */
+    bool     utc_fresh;       /* A valid decode within the last 1.5 s.                       */
+    bool     pps_alive;       /* A qualified PPS within the last 1.5 s.                      */
+    bool     pending;         /* A valid decode is waiting for the next PPS.                 */
+    bool     synced;          /* The last qualified PPS loaded the board time.               */
+    bool     once_armed;      /* A one-shot sync is armed.                                   */
+    bool     sync_every;      /* Sync mode is M2SDR_GPS_SYNC_EVERY_PPS.                       */
+    bool     time_sync_enable;/* The time generator accepts syncs (time_gen sync_enable).    */
+    uint64_t epoch;           /* UTC seconds of the last valid decode.                       */
+    uint32_t t_acc_ns;        /* Time accuracy estimate of the last good frame.              */
+    int32_t  nano_ns;         /* nano field of the last good frame.                          */
+    uint64_t pps_time_ns;     /* Board time latched on the last qualified PPS (before sync). */
+    uint64_t sync_epoch;      /* S of the last sync: board time = (S + 1) * 1e9 + offset.     */
+    uint32_t sync_offset_ns;  /* PPS pin -> time write latency compensation.                 */
+    uint32_t baudrate;        /* UART baud from the tuning word.                             */
+    uint32_t msg_count;       /* Good NAV-TIMEUTC frames.                                    */
+    uint32_t ck_errors;       /* NAV-TIMEUTC frames with a bad checksum.                     */
+    uint32_t pps_count;       /* Qualified PPS edges.                                        */
+    uint32_t pps_rejected;    /* PPS edges ignored inside the refractory window.             */
+    uint32_t sync_count;      /* Syncs applied.                                              */
+    uint32_t pps_no_utc;      /* Qualified PPS edges with no fresh valid decode pending.     */
+};
+
+/* All return M2SDR_ERR_UNSUPPORTED on gateware without the GPS input. */
+int  m2sdr_gps_get_status(struct m2sdr_dev *dev, struct m2sdr_gps_status *status);
+/* Select the sync mode; any mode other than OFF also sets the time generator's sync_enable
+ * (M2SDR_ERR_STATE while PTP owns the board time). */
+int  m2sdr_gps_set_sync(struct m2sdr_dev *dev, enum m2sdr_gps_sync_mode mode);
+int  m2sdr_gps_set_baudrate(struct m2sdr_dev *dev, uint32_t baudrate);
+int  m2sdr_gps_set_sync_offset(struct m2sdr_dev *dev, uint32_t offset_ns);
+int  m2sdr_gps_clear_counters(struct m2sdr_dev *dev);
 int  m2sdr_get_ptp_status(struct m2sdr_dev *dev, struct m2sdr_ptp_status *status);
 int  m2sdr_get_ptp_discipline_config(struct m2sdr_dev *dev, struct m2sdr_ptp_discipline_config *cfg);
 int  m2sdr_set_ptp_discipline_config(struct m2sdr_dev *dev, const struct m2sdr_ptp_discipline_config *cfg);
