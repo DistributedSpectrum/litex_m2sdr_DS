@@ -343,14 +343,10 @@ class BaseSoC(SoCMini):
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
-        if pps_forward is not None:
-            if pps_forward not in ("m2", "tp1", "tp2"):
-                raise ValueError("PPS forward output must be M.2 PPS_OUT, TP1 or TP2.")
-            # M.2 forwarding drives pin 24 (PPS_OUT), not the pin 22 input, so m2 -> m2 is fine.
-            if pps_forward in ("tp1", "tp2") and pps_forward == pps_input:
-                raise ValueError("PPS forward output cannot be the PPS input pin.")
-            if pps_forward in ("tp1", "tp2") and with_gpio:
-                raise ValueError("PPS forward on TP1/TP2 cannot be used with --with-gpio.")
+        # M.2 forwarding drives pin 24 (PPS_OUT), not the pin 22 input, so it combines with every
+        # PPS input.
+        if pps_forward not in (None, "m2"):
+            raise ValueError("PPS forward output must be M.2 PPS_OUT (m2).")
 
         if with_pcie_ptm and not with_pcie:
             raise ValueError("PCIe PTM requires PCIe to be enabled")
@@ -524,8 +520,8 @@ class BaseSoC(SoCMini):
             pps_pad = platform.request(f"pps_in_{pps_input}")
         self.pps_in = PPSInput(pps_pad, time=self.time_gen.time)
 
-        # Forward the external PPS to M.2 PPS_OUT (pin 24) or a test point (e.g. a host PPS GPIO),
-        # straight from the input pad: IBUF -> OBUF, a few ns and no clock quantization.
+        # Forward the external PPS to M.2 PPS_OUT (pin 24), e.g. to a host PPS GPIO, straight from
+        # the input pad: IBUF -> OBUF, a few ns and no clock quantization.
         if pps_forward is not None:
             self.comb += platform.request(f"pps_out_{pps_forward}").eq(pps_pad)
 
@@ -1832,8 +1828,8 @@ def main():
     parser.add_argument("--with-gpio",       action="store_true",     help="Enable GPIO support.")
     parser.add_argument("--pps-input", default="m2", choices=["m2", "tp1", "tp2"],
         help="PPS input pin (M.2 PPS_IN, TP1, or TP2).")
-    parser.add_argument("--pps-forward", default=None, choices=["m2", "tp1", "tp2"],
-        help="Forward the PPS input to M.2 PPS_OUT (pin 24), TP1 or TP2 (e.g. to a host PPS GPIO).")
+    parser.add_argument("--pps-forward", default=None, choices=["m2"],
+        help="Forward the PPS input to M.2 PPS_OUT (pin 24), e.g. to a host PPS GPIO.")
 
     # White Rabbit parameters.
     parser.add_argument("--with-white-rabbit",   action="store_true",                        help="Enable White-Rabbit Support.")

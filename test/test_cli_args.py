@@ -399,20 +399,19 @@ def test_main_passes_pps_forward_and_rfic_rx_timestamp(monkeypatch):
     monkeypatch.setattr(soc_mod, "Builder", FakeBuilder)
     monkeypatch.setattr(soc_mod, "generate_litepcie_software", lambda *args, **kwargs: None)
     monkeypatch.setattr(sys, "argv", [
-        "litex_m2sdr.py", "--pps-input=tp1", "--pps-forward=tp2", "--with-rfic-rx-timestamp",
+        "litex_m2sdr.py", "--pps-input=tp1", "--pps-forward=m2", "--with-rfic-rx-timestamp",
     ])
 
     soc_mod.main()
 
     assert captured["kwargs"]["pps_input"] == "tp1"
-    assert captured["kwargs"]["pps_forward"] == "tp2"
+    assert captured["kwargs"]["pps_forward"] == "m2"
     assert captured["kwargs"]["with_rfic_rx_timestamp"] is True
 
 
 @pytest.mark.parametrize("kwargs, match", [
-    ({"pps_input": "tp2", "pps_forward": "tp2"}, "cannot be the PPS input pin"),
-    ({"pps_forward": "tp1", "with_gpio": True},  "cannot be used with --with-gpio"),
-    ({"pps_forward": "tp3"},                     "must be M.2 PPS_OUT, TP1 or TP2"),
+    ({"pps_forward": "tp1"}, "must be M.2 PPS_OUT"),
+    ({"pps_forward": "tp2"}, "must be M.2 PPS_OUT"),
 ])
 def test_base_soc_rejects_invalid_pps_forward(kwargs, match):
     soc_mod = _load_soc_module()
