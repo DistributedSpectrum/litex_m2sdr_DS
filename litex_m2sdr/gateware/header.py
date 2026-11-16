@@ -34,9 +34,12 @@ from litex_m2sdr.gateware.ad9361.bitmode import RX_GAIN_INDEX_BITS, RX_GAIN_LOCK
 #   bits [62:56]  END3    gain index at the last word of chunk 3 (= last word of the frame)
 #   bits 23, 31, 39, 47, 55, 63 are reserved (0).
 #
-# A frame is frame_cycles stream words. Chunk c (c = 0..2) is words [c*L, (c+1)*L) with
-# L = max(1, frame_cycles // 4); chunk 3 runs from 3*L to the end of the frame. A chunk the frame
-# never reaches (frame_cycles < 4) reports BASE.
+# A frame is W = frame_cycles stream words. Chunk c is words [B(c), B(c+1)) with
+# B(c) = ceil(c * W / 4), so B(0) = 0 and B(4) = W. The rounding puts each chunk end on the word
+# that holds sample (c + 1) * S / 4 - 1 of a frame of S samples (S = 2044 in 1T1R SC16: chunk ends
+# at samples 510, 1021, 1532, 2043), which is the bladeRF chunk definition (S / 4 samples each)
+# whenever a word carries more than one sample. A chunk with no words (W < 4) reports the end of
+# the chunk before it (BASE for chunk 0's predecessor).
 #
 # The header precedes its frame in the DMA buffer, so the frame is stored first: the framer writes
 # each word into a frame FIFO while it updates the tag, then queues {tag, timestamp} once the
@@ -95,11 +98,14 @@ class RXGainTagFramer(LiteXModule):
 
         # Framing.
         # --------
-        count     = Signal(32) # Word index in the frame.
-        chunk     = Signal(2)  # Current chunk.
-        chunk_cnt = Signal(32) # Word index in the chunk.
-        chunk_len = Signal(32) # L = max(1, frame_cycles // 4).
-        self.comb += chunk_len.eq(Mux(self.frame_cycles[2:] == 0, 1, self.frame_cycles[2:]))
+        count = Signal(32) # Word index in the frame.
+        chunk = Signal(2)  # Chunk of the current word.
+        # Chunk boundaries B(1..3) = ceil(c * W / 4), registered: frame_cycles only changes while
+        # the stream is stopped (and a change flushes the framer through the inserter reset).
+        bounds = [Signal(34, name=f"chunk_bound{c}") for c in range(1, RX_GAIN_TAG_CHUNKS)]
+        for c, bound in enumerate(bounds, start=1):
+            self.sync += bound.eq((c*self.frame_cycles + (RX_GAIN_TAG_CHUNKS - 1)) >> 2)
+        self.comb += chunk.eq(sum(count >= bound for bound in bounds))
         first = Signal()
         last  = Signal()
         self.comb += [
@@ -127,8 +133,11 @@ class RXGainTagFramer(LiteXModule):
         ]
         for c in range(RX_GAIN_TAG_CHUNKS):
             # Last write wins: each chunk ends up holding the index at its last word. Every chunk
-            # starts the frame at the first word's index, so an unreached chunk reports BASE.
-            self.comb += ends_n[c].eq(Mux(first | (chunk == c), gain_index, ends[c]))
+            # starts the frame at the first word's index, and the frame's last word also writes
+            # the chunks after its own, so a chunk with no words reports the end of the chunk
+            # before it.
+            self.comb += ends_n[c].eq(Mux(first | (chunk == c) | (last & (chunk < c)),
+                gain_index, ends[c]))
 
         # Datapath.
         # ---------
@@ -155,8 +164,6 @@ class RXGainTagFramer(LiteXModule):
         self.sync += [
             If(self.flush,
                 count.eq(0),
-                chunk.eq(0),
-                chunk_cnt.eq(0),
             ).Elif(accept,
                 base.eq(base_n),
                 lock.eq(lock_n),
@@ -166,16 +173,8 @@ class RXGainTagFramer(LiteXModule):
                 *[ends[c].eq(ends_n[c]) for c in range(RX_GAIN_TAG_CHUNKS)],
                 If(last,
                     count.eq(0),
-                    chunk.eq(0),
-                    chunk_cnt.eq(0),
                 ).Else(
                     count.eq(count + 1),
-                    If((chunk != (RX_GAIN_TAG_CHUNKS - 1)) & (chunk_cnt == (chunk_len - 1)),
-                        chunk.eq(chunk + 1),
-                        chunk_cnt.eq(0),
-                    ).Else(
-                        chunk_cnt.eq(chunk_cnt + 1),
-                    )
                 )
             )
         ]

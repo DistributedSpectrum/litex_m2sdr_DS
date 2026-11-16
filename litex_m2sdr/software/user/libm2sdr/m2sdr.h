@@ -1042,8 +1042,10 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
  *   bit  [22]     CHANGED (index moved inside the frame)
  *
  * Chunks are counted in 64-bit stream WORDS (2 SC16 samples, 4 SC8 samples, a 2T2R sample pair
- * in SC16): with W payload words, L = max(1, W / 4) and chunk c (0..2) is words [c*L, (c+1)*L),
- * chunk 3 the rest. m2sdr_rx_gain_tag_chunk() does this mapping from a sample position.
+ * in SC16): with W payload words, chunk c is words [ceil(c*W/4), ceil((c+1)*W/4)). Each chunk end
+ * is the word holding sample (c+1)*S/4 - 1 of the S-sample frame, so in sample terms the chunks
+ * are the bladeRF ones (S/4 samples each: 511 for a 1T1R SC16 frame of 2044).
+ * m2sdr_rx_gain_tag_chunk() does this mapping from a sample position.
  *
  * Only RX1's index is available (one CTRL_OUT row at a time). The index is the whole gain state
  * in the AD9361 full gain-table mode with digital gain off (the libm2sdr defaults); convert it to

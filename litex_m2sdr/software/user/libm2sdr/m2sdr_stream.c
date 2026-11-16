@@ -117,19 +117,22 @@ int m2sdr_parse_rx_gain_tag(const void *header, struct m2sdr_rx_gain_tag *tag)
 
 unsigned m2sdr_rx_gain_tag_chunk(enum m2sdr_format format, unsigned msg_samples, unsigned sample_in_msg)
 {
-    /* Chunks are counted in 64-bit stream words (see m2sdr.h). */
+    /* Chunks are counted in 64-bit stream words: chunk c is words [ceil(c*W/4), ceil((c+1)*W/4))
+     * (see m2sdr.h and gateware/header.py). */
     unsigned sample_sz = m2sdr_sample_size(format);
-    unsigned words, chunk_words, word, chunk;
+    uint64_t words, word;
+    unsigned chunk = 0;
 
     if (!sample_sz)
         return 0;
-    words       = (unsigned)(((uint64_t)msg_samples * sample_sz) / 8u);
-    chunk_words = words / M2SDR_RX_GAIN_TAG_CHUNKS;
-    if (chunk_words == 0)
-        chunk_words = 1;
-    word  = (unsigned)(((uint64_t)sample_in_msg * sample_sz) / 8u);
-    chunk = word / chunk_words;
-    return chunk < M2SDR_RX_GAIN_TAG_CHUNKS ? chunk : M2SDR_RX_GAIN_TAG_CHUNKS - 1;
+    words = ((uint64_t)msg_samples * sample_sz) / 8u;
+    word  = ((uint64_t)sample_in_msg * sample_sz) / 8u;
+    for (unsigned c = 1; c < M2SDR_RX_GAIN_TAG_CHUNKS; c++) {
+        uint64_t bound = (c * words + M2SDR_RX_GAIN_TAG_CHUNKS - 1) / M2SDR_RX_GAIN_TAG_CHUNKS;
+        if (word >= bound)
+            chunk = c;
+    }
+    return chunk;
 }
 
 /* Record one DMA buffer's slice of an m2sdr_sync_rx() block (no-op unless the tag is on). */

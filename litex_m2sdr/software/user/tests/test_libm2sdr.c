@@ -432,22 +432,26 @@ static int test_rx_gain_tag_parse(void)
 
 static int test_rx_gain_tag_chunk(void)
 {
-    /* SC16, 1022 payload words = 2044 samples: L = 255 words = 510 samples. */
+    /* SC16 1T1R, 1022 payload words = 2044 samples: chunk ends on words 255, 510, 766, 1021, i.e.
+     * on the words holding samples 511, 1021, 1532, 2043 (511 samples per chunk, as bladeRF). */
     if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 0) != 0)
         return -1;
-    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 509) != 0)
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 511) != 0)
         return -1;
-    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 510) != 1)
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 512) != 1)
         return -1;
-    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 1530) != 3)
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 1021) != 1)
         return -1;
-    /* The last chunk takes the remainder (words 765..1021). */
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 1533) != 2)
+        return -1;
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 1534) != 3)
+        return -1;
     if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC16_Q11, 2044, 2043) != 3)
         return -1;
     /* SC8: 4 samples per word, same word boundaries. */
-    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1019) != 0)
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1023) != 0)
         return -1;
-    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1020) != 1)
+    if (m2sdr_rx_gain_tag_chunk(M2SDR_FORMAT_SC8_Q7, 4088, 1024) != 1)
         return -1;
     return 0;
 }

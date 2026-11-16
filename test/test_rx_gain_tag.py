@@ -29,13 +29,16 @@ def gain_field(index, lock=0, valid=1):
 
 def model_tag(gains):
     """Tag word for one frame from its per-word gain fields (the documented semantics)."""
-    n     = len(gains)
-    L     = max(1, n // 4)
-    index = [g & 0x7f for g in gains]
-    base  = index[0]
-    ends  = [base] * RX_GAIN_TAG_CHUNKS
-    for i, idx in enumerate(index):
-        ends[min(i // L, RX_GAIN_TAG_CHUNKS - 1)] = idx
+    n      = len(gains)
+    index  = [g & 0x7f for g in gains]
+    base   = index[0]
+    # Chunk c is words [ceil(c*n/4), ceil((c+1)*n/4)); a chunk with no words carries the end of
+    # the chunk before it.
+    bounds = [-(-c*n // RX_GAIN_TAG_CHUNKS) for c in range(RX_GAIN_TAG_CHUNKS + 1)]
+    ends   = []
+    for c in range(RX_GAIN_TAG_CHUNKS):
+        lo, hi = bounds[c], bounds[c + 1]
+        ends.append(index[hi - 1] if hi > lo else (ends[-1] if ends else base))
     return rx_gain_tag_word(
         valid   = all((g >> 8) & 1 for g in gains),
         lock    = (gains[0] >> 7) & 1,
@@ -144,7 +147,7 @@ def make_frames(n_frames, frame_cycles, rng, invalid_at=None):
 
 def test_gain_tag_matches_model_with_backpressure():
     rng = random.Random(7)
-    for frame_cycles in [16, 13, 4, 3, 1]:
+    for frame_cycles in [16, 13, 1022 // 64 * 2 + 2, 6, 4, 3, 2, 1]:
         frames = make_frames(6, frame_cycles, rng)
         headers, stamps, payloads, accepts = run_inserter(frames, frame_cycles,
             sink_gaps=0.3, source_stalls=0.3, seed=frame_cycles)
@@ -314,3 +317,15 @@ def test_ctrl_out_sampler_settles_and_rejects_torn_bytes():
     assert seen[0] == (1 << 8) | 0x2a
     assert all(g == (1 << 8) | 0x2a for g in seen[1:-1])
     assert seen[-1] == (1 << 8) | 0xab
+
+
+def test_gain_tag_chunk_ends_match_bladerf_sample_chunks():
+    """1T1R SC16: a 1022-word frame is 2044 samples; chunk ends sit on the words holding samples
+    510/511 (end of chunk 0 at sample 510), 1021, 1532 and 2043, i.e. 511 samples per chunk."""
+    n = 1022
+    bounds = [-(-c*n // RX_GAIN_TAG_CHUNKS) for c in range(RX_GAIN_TAG_CHUNKS + 1)]
+    last_words = [b - 1 for b in bounds[1:]]
+    assert last_words == [255, 510, 766, 1021]
+    for c, w in enumerate(last_words):
+        last_sample = (c + 1)*2044//4 - 1
+        assert last_sample // 2 == w
