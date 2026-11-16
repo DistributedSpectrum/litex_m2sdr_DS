@@ -952,6 +952,14 @@ int m2sdr_stream_deactivate(struct m2sdr_dev *dev, enum m2sdr_direction directio
  * LitePCIe this resyncs the userspace ring counters with the kernel, whose
  * counters restart across a stop/start cycle. */
 int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction);
+/* RX start alignment (LitePCIe). The gateware's DMA synchronizer holds a started RX stream until
+ * the next PPS of the board time, and the driver re-arms it on every RX start, so by default the
+ * first buffer after m2sdr_stream_activate(RX) arrives on the next whole second: up to 1 s later.
+ * With pps_aligned = false, later RX activations bypass the synchronizer and RX starts at once
+ * (each buffer still carries its timestamp when the RX header is on). The driver clears the
+ * bypass whenever RX stops, so it is re-applied on every activation. Returns
+ * M2SDR_ERR_UNSUPPORTED on a transport or gateware without the synchronizer. */
+int m2sdr_set_rx_start_pps_aligned(struct m2sdr_dev *dev, bool pps_aligned);
 int m2sdr_stream_release(struct m2sdr_dev *dev, enum m2sdr_direction direction);
 
 /* LiteEth stream-control helpers.

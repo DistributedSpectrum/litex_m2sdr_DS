@@ -1034,6 +1034,15 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
                 dev->rx_user_count = dma->writer_hw_count;
                 dev->rx_release_count = dma->writer_hw_count;
             }
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+            /* The driver's writer start armed the synchronizer (PPS-aligned start) and its
+             * writer stop cleared the bypass; release RX now if the caller asked to. Without
+             * zero-copy the writer starts on the first wait, which arms but does not clear the
+             * bypass, so writing it here covers both. */
+            if (dev->rx_start_unaligned &&
+                m2sdr_reg_write(dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1) != 0)
+                return M2SDR_ERR_IO;
+#endif
         } else if (direction == M2SDR_TX && dev->tx_configured) {
             struct litepcie_dma_ctrl *dma = &dev->tx_dma;
             dma->reader_enable = 1;
@@ -1060,6 +1069,20 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
     }
 
     return M2SDR_ERR_UNSUPPORTED;
+}
+
+int m2sdr_set_rx_start_pps_aligned(struct m2sdr_dev *dev, bool pps_aligned)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    if (dev->transport != M2SDR_TRANSPORT_LITEPCIE)
+        return pps_aligned ? M2SDR_ERR_OK : M2SDR_ERR_UNSUPPORTED;
+    dev->rx_start_unaligned = pps_aligned ? 0 : 1;
+    return M2SDR_ERR_OK;
+#else
+    return pps_aligned ? M2SDR_ERR_OK : M2SDR_ERR_UNSUPPORTED;
+#endif
 }
 
 int m2sdr_stream_release(struct m2sdr_dev *dev, enum m2sdr_direction direction)

@@ -80,6 +80,8 @@ struct m2sdr_dev {
     unsigned tx_timeout_ms;
     int64_t rx_user_count;
     int64_t rx_release_count;
+    /* m2sdr_set_rx_start_pps_aligned(false): bypass the DMA synchronizer on each RX activation. */
+    uint8_t rx_start_unaligned;
     int64_t tx_user_count;
     int64_t tx_submit_count;
     /* Zero-copy TX fill lead ahead of the LIVE reader cursor, in buffers. 0 = legacy
