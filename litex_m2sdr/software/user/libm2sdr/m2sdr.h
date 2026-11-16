@@ -1047,7 +1047,9 @@ int m2sdr_get_buffer_metadata(struct m2sdr_dev *dev,
  * are the bladeRF ones (S/4 samples each: 511 for a 1T1R SC16 frame of 2044).
  * m2sdr_rx_gain_tag_chunk() does this mapping from a sample position.
  *
- * Only RX1's index is available (one CTRL_OUT row at a time). The index is the whole gain state
+ * The CTRL_OUT pins show one channel's gain at a time (row 0x16 RX1, 0x17 RX2), so the tag
+ * describes the channel m2sdr_set_rx_gain_tag() selected: the one a 1T1R stream carries. In 2T2R
+ * the other channel is untagged. The index is the whole gain state
  * in the AD9361 full gain-table mode with digital gain off (the libm2sdr defaults); convert it to
  * dB at the frame's RX frequency with m2sdr_rx_gain_index_to_db(). The legacy 0x5aa55aa55aa55aa5
  * word decodes as version 5, so the two never collide; m2sdr_sync_rx() and
@@ -1072,11 +1074,12 @@ struct m2sdr_rx_gain_tag {
  * word (no tag; tag cleared), M2SDR_ERR_PARSE for anything else. */
 int m2sdr_parse_rx_gain_tag(const void *header, struct m2sdr_rx_gain_tag *tag);
 
-/* Enable or disable the tag. Enabling points the AD9361 CTRL_OUT mux at row 0x16 (RX1 gain
- * lock + index; needs the RF layer bound) and sets the HEADER rx_gain_tag CSR. Takes effect on
- * frames formed after the call: change it only while the RX stream is stopped. The header must
- * also be enabled (m2sdr_set_rx_header()). M2SDR_ERR_UNSUPPORTED on gateware without the tag. */
-int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable);
+/* Enable or disable the tag. Enabling points the AD9361 CTRL_OUT mux at channel's gain row
+ * (0 = RX1: row 0x16, 1 = RX2: row 0x17, lock + index; needs the RF layer bound) and sets the
+ * HEADER rx_gain_tag CSR. Takes effect on frames formed after the call: change it only while the
+ * RX stream is stopped. The header must also be enabled (m2sdr_set_rx_header()).
+ * M2SDR_ERR_UNSUPPORTED on gateware without the tag. */
+int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable, unsigned channel);
 /* enabled: the CSR is set. active: the gateware is tagging (enabled + header on + frame fits). */
 int m2sdr_get_rx_gain_tag(struct m2sdr_dev *dev, bool *enabled, bool *active);
 

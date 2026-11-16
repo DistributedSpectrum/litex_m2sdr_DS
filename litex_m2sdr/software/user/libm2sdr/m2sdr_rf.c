@@ -2777,9 +2777,11 @@ int m2sdr_rf_calibrate_interface_delay(struct m2sdr_dev *dev)
 
 /* RX gain tag ------------------------------------------------------------------------------------*/
 
-/* AD9361 CTRL_OUT row 0x16: CTRL_OUT[7] = RX1 gain lock, CTRL_OUT[6:0] = RX1 full gain-table
- * index (UG-570 Table 44). The FPGA samples these pins for the RX header gain tag. */
+/* AD9361 CTRL_OUT rows 0x16 / 0x17: CTRL_OUT[7] = RX1 / RX2 gain lock, CTRL_OUT[6:0] = RX1 /
+ * RX2 full gain-table index (UG-570 Table 44). The FPGA samples these pins for the RX header gain
+ * tag. */
 #define M2SDR_CTRL_OUT_ROW_RX1_GAIN 0x16
+#define M2SDR_CTRL_OUT_ROW_RX2_GAIN 0x17
 #define M2SDR_CTRL_OUT_ENABLE_ALL   0xff
 
 static int m2sdr_rx_gain_tag_supported(struct m2sdr_dev *dev)
@@ -2795,9 +2797,9 @@ static int m2sdr_rx_gain_tag_supported(struct m2sdr_dev *dev)
 #endif
 }
 
-int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable)
+int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable, unsigned channel)
 {
-    if (!dev)
+    if (!dev || channel > 1)
         return M2SDR_ERR_INVAL;
     int supported = m2sdr_rx_gain_tag_supported(dev);
     if (supported < 0)
@@ -2806,16 +2808,17 @@ int m2sdr_set_rx_gain_tag(struct m2sdr_dev *dev, bool enable)
         return enable ? M2SDR_ERR_UNSUPPORTED : M2SDR_ERR_OK;
 #if defined(CSR_HEADER_RX_GAIN_TAG_ADDR)
     if (enable) {
-        /* The default init params already select row 0x16; write it again so a phy brought up
-         * with other params (or a CTRL_OUT change since) still tags the RX1 gain. */
+        /* The default init params select row 0x16 (RX1); write the channel's row so a phy
+         * brought up with other params (or a CTRL_OUT change since) tags the right gain. */
+        const uint8_t row = channel ? M2SDR_CTRL_OUT_ROW_RX2_GAIN : M2SDR_CTRL_OUT_ROW_RX1_GAIN;
         struct ad9361_rf_phy *phy;
         int rc = m2sdr_require_phy(dev, &phy);
         if (rc != M2SDR_ERR_OK)
             return rc;
-        if (ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_POINTER, M2SDR_CTRL_OUT_ROW_RX1_GAIN) < 0 ||
+        if (ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_POINTER, row) < 0 ||
             ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_ENABLE, M2SDR_CTRL_OUT_ENABLE_ALL) < 0)
             return M2SDR_ERR_IO;
-        phy->pdata->ctrl_outs_ctrl.index   = M2SDR_CTRL_OUT_ROW_RX1_GAIN;
+        phy->pdata->ctrl_outs_ctrl.index   = row;
         phy->pdata->ctrl_outs_ctrl.en_mask = M2SDR_CTRL_OUT_ENABLE_ALL;
     }
     if (m2sdr_reg_write(dev, CSR_HEADER_RX_GAIN_TAG_ADDR,
