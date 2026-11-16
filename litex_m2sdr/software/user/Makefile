@@ -230,8 +230,9 @@ libm2sdr/libm2sdr.a: $(BUILD_FLAGS_FILE) $(LIBM2SDR_OBJS)
 	$(AR) rcs $@ $(LIBM2SDR_OBJS)
 	ranlib $@
 
-libm2sdr/$(LIBM2SDR_SONAME): $(BUILD_FLAGS_FILE) $(LIBM2SDR_OBJS)
-	$(CC) $(LINK_CFLAGS) $(LDFLAGS) -shared -Wl,-soname,$(LIBM2SDR_SONAME) -Wl,-Bsymbolic -o $@ $(LIBM2SDR_OBJS)
+libm2sdr/$(LIBM2SDR_SONAME): $(BUILD_FLAGS_FILE) $(LIBM2SDR_OBJS) libm2sdr/libm2sdr.map
+	$(CC) $(LINK_CFLAGS) $(LDFLAGS) -shared -Wl,-soname,$(LIBM2SDR_SONAME) -Wl,-Bsymbolic \
+		-Wl,--version-script,libm2sdr/libm2sdr.map -o $@ $(LIBM2SDR_OBJS)
 
 libm2sdr/libm2sdr.so: libm2sdr/$(LIBM2SDR_SONAME)
 	ln -sf $(LIBM2SDR_SONAME) $@

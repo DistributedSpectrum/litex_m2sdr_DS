@@ -1,0 +1,13 @@
+/* Exports of libm2sdr.so: the public API (m2sdr.h, m2sdr_sigmf.h), all m2sdr_*.
+ *
+ * Everything else stays local. The bundled AD9361 no-OS driver (ad9361_*, spi_*, ...) has the
+ * same symbol names as the copy inside libbladeRF, so a process linking both (the ds sdr service)
+ * had libbladeRF's own calls bound to libm2sdr's driver and bladerf_open() failed in ad9361_init().
+ * -Bsymbolic only protects libm2sdr's calls, not the other library's. The Soapy module does the
+ * same with --exclude-libs,ALL. */
+{
+    global:
+        m2sdr_*;
+    local:
+        *;
+};
