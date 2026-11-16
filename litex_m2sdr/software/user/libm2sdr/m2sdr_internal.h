@@ -65,6 +65,9 @@ struct m2sdr_dev {
     struct m2sdr_rx_gain_tag_msg *rx_gain_tags;
     size_t rx_gain_tags_cap;
     size_t rx_gain_tags_num;
+    /* RX gain calibration tables per channel (m2sdr_load_rx_gain_calibration). */
+    struct m2sdr_gain_cal *rx_gain_cal[2];
+    int rx_gain_cal_enabled[2];
     int rx_header_enable;
     int rx_strip_header;
     int tx_header_enable;

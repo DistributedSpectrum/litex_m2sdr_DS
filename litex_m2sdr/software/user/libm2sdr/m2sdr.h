@@ -1116,6 +1116,70 @@ unsigned m2sdr_rx_gain_tag_chunk(enum m2sdr_format format, unsigned msg_samples,
 int m2sdr_rx_gain_index_to_db(struct m2sdr_dev *dev, unsigned gain_index,
                               uint64_t rx_freq_hz, int *gain_db);
 
+/* RX gain calibration tables (dBFS -> dBm).
+ *
+ * The AD9361 table gain is nominal: what a capture's full-scale-relative power (dBFS) means in
+ * dBm at the antenna port also depends on the board's front end at that frequency. A per-board
+ * table, measured with a signal generator into the RX port and stepped across the LO range,
+ * gives the correction, in the same files the bladeRF tooling writes: the CSV
+ * ("Serial: <serial>" + the bladeRF RX header + rows chain,gain,dBm_in,f_sig,f_lo,rssi,dBFS)
+ * or its .tbl (libbladeRF image) form, detected by content. Each row yields
+ *
+ *     gain_corr(f_lo) = (dBFS - dBm_in) - G_commanded
+ *
+ * (the bladeRF tables are swept at G = 0, so this is libbladeRF's gain_corr), interpolated
+ * linearly in LO and clamped at the table ends. With the nominal gain G of the gain index in force
+ * (m2sdr_rx_gain_index_to_db(), or a gain tag's index):
+ *
+ *     dBm_in = dBFS - (G + gain_corr(f_lo))       // m2sdr_rx_gain_db_at() returns G + gain_corr
+ *
+ * Channels: 0 = RX1, 1 = RX2. Rows are matched by RX chain in libbladeRF channel numbering
+ * (RX1 = 0, RX2 = 2), or plain indices (RX2 = 1) when the table has no chain-2 rows; when a
+ * chain was swept at several gains, the rows at its first gain are used. */
+#define M2SDR_GAIN_CAL_SERIAL_MAX 33
+#define M2SDR_GAIN_CAL_PATH_MAX   256
+
+struct m2sdr_gain_cal;           /* Opaque; usable without a device (offline conversion). */
+
+struct m2sdr_gain_cal_entry {
+    uint64_t freq_hz;            /* LO frequency of the measurement. */
+    double   gain_corr_db;       /* (dBFS - dBm_in) - G at that LO.   */
+};
+
+struct m2sdr_gain_cal_info {
+    unsigned channel;
+    uint32_t n_entries;
+    int32_t  gain_db;            /* Commanded gain the rows were measured at. */
+    uint64_t start_freq_hz;
+    uint64_t stop_freq_hz;
+    char     serial[M2SDR_GAIN_CAL_SERIAL_MAX];
+    char     path[M2SDR_GAIN_CAL_PATH_MAX];
+};
+
+/* Load channel's rows from a .csv or .tbl table. M2SDR_ERR_PARSE for a file that is neither an
+ * RX gain CSV nor an RX .tbl, M2SDR_ERR_RANGE when it has no rows for the channel. */
+int  m2sdr_gain_cal_load(const char *path, unsigned channel, struct m2sdr_gain_cal **cal);
+void m2sdr_gain_cal_free(struct m2sdr_gain_cal *cal);
+int  m2sdr_gain_cal_get_info(const struct m2sdr_gain_cal *cal, struct m2sdr_gain_cal_info *info);
+int  m2sdr_gain_cal_get_entries(const struct m2sdr_gain_cal *cal,
+                                const struct m2sdr_gain_cal_entry **entries, size_t *n_entries);
+/* gain_corr (dB) at an LO frequency: linear between rows, clamped outside the table. */
+int  m2sdr_gain_cal_correction(const struct m2sdr_gain_cal *cal, uint64_t freq_hz, double *gain_corr_db);
+
+/* Attach a table to an RX channel of a device (replacing any; enabled on load). */
+int  m2sdr_load_rx_gain_calibration(struct m2sdr_dev *dev, unsigned channel, const char *path);
+int  m2sdr_unload_rx_gain_calibration(struct m2sdr_dev *dev, unsigned channel);
+/* M2SDR_ERR_STATE when enabling a channel with no table. */
+int  m2sdr_enable_rx_gain_calibration(struct m2sdr_dev *dev, unsigned channel, bool enable);
+/* The channel's table (NULL when none); *enabled tells whether it is applied. */
+const struct m2sdr_gain_cal *m2sdr_get_rx_gain_calibration(struct m2sdr_dev *dev, unsigned channel,
+                                                           bool *enabled);
+/* Total RX gain (dB) of gain_index at rx_freq_hz on channel: the AD9361 table gain plus, when the
+ * channel's table is enabled, gain_corr(rx_freq_hz) (*calibrated says which). dBm = dBFS - gain_db.
+ * The bladerf_rx_gain_tag_to_gain_db_at() counterpart. Pass the LO the samples were captured at. */
+int  m2sdr_rx_gain_db_at(struct m2sdr_dev *dev, unsigned channel, unsigned gain_index,
+                         uint64_t rx_freq_hz, double *gain_db, bool *calibrated);
+
 /* Backend notes for zero-copy submit/release:
  *
  * - m2sdr_submit_buffer() performs an explicit enqueue on LiteEth and advances

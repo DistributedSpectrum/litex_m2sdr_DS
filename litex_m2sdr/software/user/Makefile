@@ -107,6 +107,7 @@ LIBM2SDR_OBJS = \
 	libm2sdr/m2sdr_stream.o \
 	libm2sdr/m2sdr_mwaitx.o \
 	libm2sdr/m2sdr_rf.o \
+	libm2sdr/m2sdr_gain_cal.o \
 	libm2sdr/m2sdr_sata.o \
 	libm2sdr/m2sdr_utils.o \
 	libm2sdr/m2sdr_json.o \

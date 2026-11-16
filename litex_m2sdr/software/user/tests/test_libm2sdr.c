@@ -456,6 +456,133 @@ static int test_rx_gain_tag_chunk(void)
     return 0;
 }
 
+/* Write a small RX gain table as CSV and as .tbl (libbladeRF image layout); both must load the
+ * same corrections. Rows: RX1 (chain 0) at 3 LOs, RX2 (chain 2) at 2 LOs, one RX1 row at another
+ * gain that must be ignored. gain_corr = dBFS - dBm_in - G. */
+static const struct {
+    uint8_t chain; int32_t gain; float vsg; uint64_t sig, lo; int32_t rssi; float dbfs;
+} gc_rows[] = {
+    {0, 0, -20.0f, 100200000ull, 100000000ull, -40, -30.0f}, /* corr -10 */
+    {0, 0, -20.0f, 300200000ull, 300000000ull, -40, -26.0f}, /* corr  -6 */
+    {0, 0, -20.0f, 200200000ull, 200000000ull, -40, -28.0f}, /* corr  -8 (out of order) */
+    {2, 0, -20.0f, 100200000ull, 100000000ull, -40, -21.0f}, /* corr  -1 */
+    {2, 0, -20.0f, 200200000ull, 200000000ull, -40, -23.0f}, /* corr  -3 */
+    {0, 10, -20.0f, 100200000ull, 100000000ull, -40, 0.0f},  /* other gain: ignored */
+};
+
+static int gc_write_csv(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "Serial: 0123456789abcdef0123456789abcdef\n");
+    fprintf(f, "RX Chain,RX Gain,VSG Power into bladeRF RX (dBm),Frequency of signal (Hz),"
+               "Frequency of bladeRF+PXI (Hz),AD9361 RSSI register value,"
+               "Power of Signal from Full Scale (dBFS)\n");
+    for (size_t i = 0; i < sizeof(gc_rows) / sizeof(gc_rows[0]); i++)
+        fprintf(f, "%u,%d,%f,%llu,%llu,%d,%f\n", gc_rows[i].chain, gc_rows[i].gain,
+                gc_rows[i].vsg, (unsigned long long)gc_rows[i].sig,
+                (unsigned long long)gc_rows[i].lo, gc_rows[i].rssi, gc_rows[i].dbfs);
+    fclose(f);
+    return 0;
+}
+
+static int gc_write_tbl(const char *path)
+{
+    uint8_t hdr[226];
+    size_t n = sizeof(gc_rows) / sizeof(gc_rows[0]);
+    uint32_t len = 33 + (uint32_t)n * 33;
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return -1;
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, "bladeRF", 7);
+    hdr[222] = (uint8_t)(len >> 24); hdr[223] = (uint8_t)(len >> 16);
+    hdr[224] = (uint8_t)(len >> 8);  hdr[225] = (uint8_t)len;
+    fwrite(hdr, 1, sizeof(hdr), f);
+    char serial[33] = "0123456789abcdef0123456789abcdef";
+    fwrite(serial, 1, 33, f);
+    for (size_t i = 0; i < n; i++) {
+        fwrite(&gc_rows[i].chain, 1, 1, f);
+        fwrite(&gc_rows[i].gain, 4, 1, f);
+        fwrite(&gc_rows[i].vsg, 4, 1, f);
+        fwrite(&gc_rows[i].sig, 8, 1, f);
+        fwrite(&gc_rows[i].lo, 8, 1, f);
+        fwrite(&gc_rows[i].rssi, 4, 1, f);
+        fwrite(&gc_rows[i].dbfs, 4, 1, f);
+    }
+    fclose(f);
+    return 0;
+}
+
+static int gc_near(double a, double b) { return a - b < 1e-4 && b - a < 1e-4; }
+
+static int gc_check(const char *path)
+{
+    struct m2sdr_gain_cal *rx1 = NULL, *rx2 = NULL;
+    struct m2sdr_gain_cal_info info;
+    double c;
+    int ok = 0;
+
+    if (m2sdr_gain_cal_load(path, 0, &rx1) != M2SDR_ERR_OK ||
+        m2sdr_gain_cal_load(path, 1, &rx2) != M2SDR_ERR_OK)
+        goto out;
+    if (m2sdr_gain_cal_get_info(rx1, &info) != M2SDR_ERR_OK || info.n_entries != 3 ||
+        info.start_freq_hz != 100000000ull || info.stop_freq_hz != 300000000ull ||
+        info.gain_db != 0 || strcmp(info.serial, "0123456789abcdef0123456789abcdef") != 0)
+        goto out;
+    /* Exact rows, interpolation, clamping at both ends. */
+    if (m2sdr_gain_cal_correction(rx1, 200000000ull, &c) || !gc_near(c, -8.0)) goto out;
+    if (m2sdr_gain_cal_correction(rx1, 150000000ull, &c) || !gc_near(c, -9.0)) goto out;
+    if (m2sdr_gain_cal_correction(rx1, 275000000ull, &c) || !gc_near(c, -6.5)) goto out;
+    if (m2sdr_gain_cal_correction(rx1, 50000000ull,  &c) || !gc_near(c, -10.0)) goto out;
+    if (m2sdr_gain_cal_correction(rx1, 6000000000ull, &c) || !gc_near(c, -6.0)) goto out;
+    /* RX2 from the chain-2 rows. */
+    if (m2sdr_gain_cal_correction(rx2, 150000000ull, &c) || !gc_near(c, -2.0)) goto out;
+    ok = 1;
+out:
+    m2sdr_gain_cal_free(rx1);
+    m2sdr_gain_cal_free(rx2);
+    return ok ? 0 : -1;
+}
+
+static int test_rx_gain_calibration_tables(void)
+{
+    char dir[] = "/tmp/m2sdr_gain_cal_XXXXXX";
+    char csv[64], tbl[64], bad[64];
+    struct m2sdr_gain_cal *cal = NULL;
+    int rc = -1;
+
+    if (!mkdtemp(dir))
+        return -1;
+    snprintf(csv, sizeof(csv), "%s/t.csv", dir);
+    snprintf(tbl, sizeof(tbl), "%s/t.tbl", dir);
+    snprintf(bad, sizeof(bad), "%s/bad.csv", dir);
+    if (gc_write_csv(csv) || gc_write_tbl(tbl))
+        goto out;
+    if (gc_check(csv) || gc_check(tbl))
+        goto out;
+    /* Not a gain table; and a missing file. */
+    FILE *f = fopen(bad, "w");
+    if (!f)
+        goto out;
+    fprintf(f, "Serial: x\nnot,a,gain,table\n");
+    fclose(f);
+    if (m2sdr_gain_cal_load(bad, 0, &cal) != M2SDR_ERR_PARSE || cal)
+        goto out;
+    if (m2sdr_gain_cal_load("/nonexistent/x.csv", 0, &cal) != M2SDR_ERR_IO)
+        goto out;
+    if (m2sdr_gain_cal_load(csv, 2, &cal) != M2SDR_ERR_INVAL)
+        goto out;
+    rc = 0;
+out:
+    unlink(csv);
+    unlink(tbl);
+    unlink(bad);
+    rmdir(dir);
+    return rc;
+}
+
 static int test_stream_direction_validation(void)
 {
     struct m2sdr_dev dev;
@@ -751,6 +878,10 @@ int main(void)
     }
     if (test_rx_gain_tag_chunk() != 0) {
         fprintf(stderr, "test_rx_gain_tag_chunk failed\n");
+        return 1;
+    }
+    if (test_rx_gain_calibration_tables() != 0) {
+        fprintf(stderr, "test_rx_gain_calibration_tables failed\n");
         return 1;
     }
     if (test_stream_direction_validation() != 0) {
