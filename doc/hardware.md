@@ -65,7 +65,7 @@ Each rising edge also latches the board time into the `pps_in_time` CSR (ns). Wi
 
 The M.2 breakout carries a Gateworks GW16143 (u-blox ZED-F9P) to the SDR: GPS UART1 TX on `Synchro_GPIO2` (M.2 pin 30, `A18`), GPS RX on `Synchro_GPIO3` (pin 32, `A21`), and the timepulse on `PPS_IN` (pin 22, `K18`). All are 3.3V.
 
-`--with-gps` adds the GPS time core (`gateware/gps.py`). It decodes UBX-NAV-TIMEUTC (Fletcher checksum, validUTC flag) into a UTC second, qualifies the PPS (8-cycle glitch filter, 0.9 s refractory window after each accepted edge), and can load the board time with `(S + 1) * 1e9 + sync_offset` ns on the PPS that starts second `S + 1`. RX header timestamps and timed TX then run on GPS UTC. It is off by default because pins 28 to 36 are only safe to drive with the breakout fitted.
+`--with-gps` adds the GPS time core (`gateware/gps.py`). It decodes UBX-NAV-TIMEUTC (Fletcher checksum, validUTC flag) into a UTC second, qualifies the PPS (8-cycle glitch filter, 0.9 s refractory window after each accepted edge), and can load the board time with `(S + 1) * 1e9 + sync_offset` ns on the PPS that starts second `S + 1`. RX header timestamps and timed TX then run on GPS UTC. It is off by default because pins 28 to 36 are only safe to drive with the breakout fitted. `--gps-rx-only` builds the core with inputs only (GPS UART RX on pin 30 plus `PPS_IN`) and drives no breakout pin, so that image is safe to load without the breakout. The F9P is provisioned over USB anyway.
 
 ```sh
 ./litex_m2sdr.py --variant=m2 --with-pcie --pcie-lanes=4 --with-gps --pps-forward=m2 --build

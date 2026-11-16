@@ -355,7 +355,7 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         pps_input              = "m2",
         pps_forward            = None,
-        with_gps               = False, gps_baudrate=115200,
+        with_gps               = False, gps_baudrate=115200, gps_rx_only=False,
         with_rfic_oversampling = False,
         with_rfic_rx_timestamp = False,
         with_rx_gain_tag       = True,
@@ -559,7 +559,9 @@ class BaseSoC(SoCMini):
         # PPS is the same pad as pps_in; the UART is on the M.2 breakout's Synchro_GPIO2/3.
         if with_gps:
             self.gps = GPSTime(
-                uart_pads    = platform.request("gps_uart"),
+                # rx_only: the FPGA -> GPS line is not requested, so no M.2 pin is driven and the
+                # image is safe to load without the breakout (the F9P is provisioned over USB).
+                uart_pads    = platform.request("gps_uart_rx" if gps_rx_only else "gps_uart"),
                 pps_pad      = pps_pad,
                 time_gen     = self.time_gen,
                 sys_clk_freq = sys_clk_freq,
@@ -1872,6 +1874,8 @@ def main():
     parser.add_argument("--with-gps", action="store_true",
         help="GPS time input: UBX-NAV-TIMEUTC on the M.2 breakout UART (Synchro_GPIO2/3) + the PPS input sync the board time to UTC.")
     parser.add_argument("--gps-baudrate", default=115200, type=int, help="GPS UART baud rate at reset (CSR-adjustable).")
+    parser.add_argument("--gps-rx-only", action="store_true",
+        help="With --with-gps: inputs only (GPS UART RX + PPS); the FPGA drives no M.2 breakout pin, so the image is safe without the breakout.")
     parser.add_argument("--pps-forward", default=None, choices=["m2"],
         help="Forward the PPS input to M.2 PPS_OUT (pin 24), e.g. to a host PPS GPIO.")
 
@@ -1985,6 +1989,7 @@ def main():
         pps_forward   = args.pps_forward,
         with_gps      = args.with_gps,
         gps_baudrate  = args.gps_baudrate,
+        gps_rx_only   = args.gps_rx_only,
         with_jtagbone = not args.without_jtagbone,
 
         # White Rabbit.
@@ -2058,7 +2063,7 @@ def main():
         if not args.with_rx_gain_tag:
             r += "_no_rx_gain_tag"
         if args.with_gps:
-            r += "_gps"
+            r += "_gps_rx" if args.gps_rx_only else "_gps"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r

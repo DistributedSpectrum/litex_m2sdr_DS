@@ -139,6 +139,11 @@ _io = [
         Subsignal("tx", Pins("M2:NC32")), # M.2 pin 32 / Synchro_GPIO3 / A21.
         IOStandard("LVCMOS33"),
     ),
+    # Receive side only (--gps-rx-only): the FPGA drives nothing on the breakout pins.
+    ("gps_uart_rx", 0,
+        Subsignal("rx", Pins("M2:NC30")), # M.2 pin 30 / Synchro_GPIO2 / A18.
+        IOStandard("LVCMOS33"),
+    ),
 ]
 
 _io_baseboard = [ # Note: These IOs are only available when the board is plugged in Acorn Baseboard Mini.
