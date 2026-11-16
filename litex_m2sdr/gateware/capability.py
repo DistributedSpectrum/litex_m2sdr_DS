@@ -8,6 +8,19 @@ from litex.gen import *
 
 from litex.soc.interconnect.csr import *
 
+# Gateware Version ---------------------------------------------------------------------------------
+
+# Distributed Spectrum gateware release, readable at runtime (capability gateware_version; libm2sdr
+# m2sdr_get_gateware_version()). Every change that ships bumps the patch number only; major.minor
+# stay put. Images built before this register existed read 0 there.
+GATEWARE_VERSION = "1.1.0"
+
+def gateware_version_word(version_str):
+    """major.minor.patch -> (major << 16) | (minor << 8) | patch (compares as an integer)."""
+    major, minor, patch = map(int, version_str.split("."))
+    assert 0 <= major < 2**16 and 0 <= minor < 2**8 and 0 <= patch < 2**8
+    return (major << 16) | (minor << 8) | patch
+
 # Capability ---------------------------------------------------------------------------------------
 
 class Capability(LiteXModule):
@@ -32,7 +45,12 @@ class Capability(LiteXModule):
         # RX gain tag.
         rx_gain_tag=0,
         # GPS time input.
-        gps=0):
+        gps=0,
+        # Gateware release and build provenance.
+        gateware_version_str = GATEWARE_VERSION,
+        git_hash             = 0,
+        git_dirty            = False,
+        build_time           = 0):
 
         # API Version.
         # ------------
@@ -152,3 +170,24 @@ class Capability(LiteXModule):
             CSRField("wr_sfp",   size=1, offset=4, reset=int(wr_sfp),   description="White Rabbit SFP index."),
             # Reserved bits.
         ], description="Board-level configuration.")
+
+        # Gateware Version / Build Info.
+        # ------------------------------
+        # Appended after the existing capability CSRs so their addresses do not move; older images
+        # read 0 here, which software takes as "unversioned".
+        self._gateware_version = CSRStatus(32, fields=[
+            CSRField("patch", size=8,  offset=0,  reset=gateware_version_word(gateware_version_str) & 0xff,
+                description="Patch number: bumped for every change."),
+            CSRField("minor", size=8,  offset=8,  reset=(gateware_version_word(gateware_version_str) >> 8) & 0xff,
+                description="Minor number."),
+            CSRField("major", size=16, offset=16, reset=gateware_version_word(gateware_version_str) >> 16,
+                description="Major number."),
+        ], description=f"Gateware release (v{gateware_version_str}): (major << 16) | (minor << 8) | patch.")
+        self._git_hash = CSRStatus(32, reset=git_hash & 0xffffffff,
+            description="First 8 hex digits of the litex_m2sdr commit the gateware was built from (0: unknown).")
+        self._build_info = CSRStatus(32, fields=[
+            CSRField("git_dirty", size=1, offset=0, reset=int(bool(git_dirty)),
+                description="The tree had uncommitted changes when the gateware was built."),
+        ], description="Build flags.")
+        self._build_time = CSRStatus(32, reset=build_time & 0xffffffff,
+            description="Build time, UTC seconds since 1970 (0: unknown).")

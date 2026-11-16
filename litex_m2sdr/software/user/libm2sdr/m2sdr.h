@@ -59,9 +59,9 @@ enum m2sdr_error {
 
 /* libm2sdr starts its public compatibility story at v1.0.0. Keep the ABI
  * major in sync with the installed shared-library SONAME. */
-#define M2SDR_API_VERSION 0x00010200
+#define M2SDR_API_VERSION 0x00010201
 #define M2SDR_ABI_VERSION 0x00010000
-#define M2SDR_VERSION_STRING "1.2.0"
+#define M2SDR_VERSION_STRING "1.2.1"
 
 struct m2sdr_version {
     uint32_t api;
@@ -276,6 +276,25 @@ struct m2sdr_capabilities {
     uint32_t pcie_config;
     uint32_t eth_config;
     uint32_t sata_config;
+};
+
+/* Gateware release, read from the FPGA at runtime (Distributed Spectrum images from v1.1.0 on;
+ * every change bumps the patch number). Compare versions as integers:
+ *     if (gw.known && gw.version >= M2SDR_GATEWARE_VERSION(1, 1, 2)) ...
+ * An image built before the register existed reads known = false with every field 0; its build
+ * date is still in m2sdr_devinfo.identification. */
+#define M2SDR_GATEWARE_VERSION(major, minor, patch) \
+    (((uint32_t)(major) << 16) | ((uint32_t)(minor) << 8) | (uint32_t)(patch))
+
+struct m2sdr_gateware_version {
+    bool     known;       /* The image reports a gateware version.                       */
+    uint32_t version;     /* M2SDR_GATEWARE_VERSION(major, minor, patch).                */
+    uint16_t major;
+    uint8_t  minor;
+    uint8_t  patch;
+    uint32_t git_hash;    /* First 8 hex digits of the litex_m2sdr commit (0: unknown).  */
+    bool     git_dirty;   /* Built from a tree with uncommitted changes.                 */
+    uint64_t build_time;  /* Build time, UTC seconds since 1970 (0: unknown).            */
 };
 
 #define M2SDR_SATA_SERIAL_MAX   21
@@ -679,6 +698,9 @@ int  m2sdr_get_device_list(struct m2sdr_devinfo *list, size_t max, size_t *count
 /* Read stable transport/path/serial/identifier metadata from an open device. */
 int  m2sdr_get_device_info(struct m2sdr_dev *dev, struct m2sdr_devinfo *info);
 int  m2sdr_get_capabilities(struct m2sdr_dev *dev, struct m2sdr_capabilities *caps);
+/* Gateware release and build provenance (struct m2sdr_gateware_version). M2SDR_ERR_OK with
+ * known = false on an image that predates the version register. */
+int  m2sdr_get_gateware_version(struct m2sdr_dev *dev, struct m2sdr_gateware_version *version);
 int  m2sdr_get_identifier(struct m2sdr_dev *dev, char *buf, size_t len);
 int  m2sdr_get_fpga_git_hash(struct m2sdr_dev *dev, uint32_t *hash);
 int  m2sdr_get_clock_info(struct m2sdr_dev *dev, struct m2sdr_clock_info *info);
@@ -768,6 +790,7 @@ struct m2sdr_gps_status {
     bool     once_armed;      /* A one-shot sync is armed.                                   */
     bool     sync_every;      /* Sync mode is M2SDR_GPS_SYNC_EVERY_PPS.                       */
     bool     time_sync_enable;/* The time generator accepts syncs (time_gen sync_enable).    */
+    bool     pps_bypass;      /* The PPS pin is ignored (m2sdr_gps_set_pps_bypass()).        */
     uint64_t epoch;           /* UTC seconds of the last valid decode.                       */
     uint32_t t_acc_ns;        /* Time accuracy estimate of the last good frame.              */
     int32_t  nano_ns;         /* nano field of the last good frame.                          */
@@ -791,6 +814,12 @@ int  m2sdr_gps_set_sync(struct m2sdr_dev *dev, enum m2sdr_gps_sync_mode mode);
 int  m2sdr_gps_set_baudrate(struct m2sdr_dev *dev, uint32_t baudrate);
 int  m2sdr_gps_set_sync_offset(struct m2sdr_dev *dev, uint32_t offset_ns);
 int  m2sdr_gps_clear_counters(struct m2sdr_dev *dev);
+/* PPS bypass: with bypass = true the gateware ignores the PPS pin. No PPS is qualified, latched,
+ * counted or used to sync, so the board time free-runs (whatever the sync mode); UBX decoding
+ * continues. For a PPS line that is missing, noisy or not trusted. Off at power-up/reload; kept
+ * across opens and by the other m2sdr_gps_* calls. The pps_in CSRs still see the pin. The
+ * bladeRF_DS gps_uart image has the same switch (bladerf_set_gps_pps_bypass()). */
+int  m2sdr_gps_set_pps_bypass(struct m2sdr_dev *dev, bool bypass);
 int  m2sdr_get_ptp_status(struct m2sdr_dev *dev, struct m2sdr_ptp_status *status);
 int  m2sdr_get_ptp_discipline_config(struct m2sdr_dev *dev, struct m2sdr_ptp_discipline_config *cfg);
 int  m2sdr_set_ptp_discipline_config(struct m2sdr_dev *dev, const struct m2sdr_ptp_discipline_config *cfg);

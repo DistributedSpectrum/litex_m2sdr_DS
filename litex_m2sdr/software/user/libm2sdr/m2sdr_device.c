@@ -1156,6 +1156,47 @@ int m2sdr_get_capabilities(struct m2sdr_dev *dev, struct m2sdr_capabilities *cap
     return M2SDR_ERR_OK;
 }
 
+/* The version CSRs sit at fixed offsets after the six original capability CSRs (appended so those
+ * never move), so a libm2sdr built against an older image's headers still finds them on a newer
+ * image. */
+#if defined(CSR_CAPABILITY_BASE) && !defined(CSR_CAPABILITY_GATEWARE_VERSION_ADDR)
+#define CSR_CAPABILITY_GATEWARE_VERSION_ADDR         (CSR_CAPABILITY_BASE + 0x18L)
+#define CSR_CAPABILITY_GIT_HASH_ADDR                 (CSR_CAPABILITY_BASE + 0x1cL)
+#define CSR_CAPABILITY_BUILD_INFO_ADDR               (CSR_CAPABILITY_BASE + 0x20L)
+#define CSR_CAPABILITY_BUILD_TIME_ADDR               (CSR_CAPABILITY_BASE + 0x24L)
+#define CSR_CAPABILITY_GATEWARE_VERSION_PATCH_OFFSET 0
+#define CSR_CAPABILITY_GATEWARE_VERSION_MINOR_OFFSET 8
+#define CSR_CAPABILITY_GATEWARE_VERSION_MAJOR_OFFSET 16
+#define CSR_CAPABILITY_BUILD_INFO_GIT_DIRTY_OFFSET   0
+#endif
+
+int m2sdr_get_gateware_version(struct m2sdr_dev *dev, struct m2sdr_gateware_version *version)
+{
+    if (!dev || !version)
+        return M2SDR_ERR_INVAL;
+    memset(version, 0, sizeof(*version));
+#if defined(CSR_CAPABILITY_GATEWARE_VERSION_ADDR)
+    /* Older images have no CSR here: the capability bank reads 0 for an unused address. */
+    uint32_t v = 0, hash = 0, info = 0, t = 0;
+    if (m2sdr_reg_read(dev, CSR_CAPABILITY_GATEWARE_VERSION_ADDR, &v) != 0 ||
+        m2sdr_reg_read(dev, CSR_CAPABILITY_GIT_HASH_ADDR, &hash) != 0 ||
+        m2sdr_reg_read(dev, CSR_CAPABILITY_BUILD_INFO_ADDR, &info) != 0 ||
+        m2sdr_reg_read(dev, CSR_CAPABILITY_BUILD_TIME_ADDR, &t) != 0)
+        return M2SDR_ERR_IO;
+    if (v == 0)
+        return M2SDR_ERR_OK;
+    version->known      = true;
+    version->version    = v;
+    version->major      = (uint16_t)(v >> CSR_CAPABILITY_GATEWARE_VERSION_MAJOR_OFFSET);
+    version->minor      = (uint8_t)(v >> CSR_CAPABILITY_GATEWARE_VERSION_MINOR_OFFSET);
+    version->patch      = (uint8_t)(v >> CSR_CAPABILITY_GATEWARE_VERSION_PATCH_OFFSET);
+    version->git_hash   = hash;
+    version->git_dirty  = ((info >> CSR_CAPABILITY_BUILD_INFO_GIT_DIRTY_OFFSET) & 1u) != 0;
+    version->build_time = t;
+#endif
+    return M2SDR_ERR_OK;
+}
+
 /* Return the FPGA identifier string directly from the identifier memory. */
 int m2sdr_get_identifier(struct m2sdr_dev *dev, char *buf, size_t len)
 {
@@ -1903,6 +1944,7 @@ int m2sdr_gps_get_status(struct m2sdr_dev *dev, struct m2sdr_gps_status *status)
     status->synced     = M2SDR_GPS_BIT(st, STATUS, SYNCED);
     status->once_armed = M2SDR_GPS_BIT(st, STATUS, ONCE_ARMED);
     status->sync_every = M2SDR_GPS_BIT(ctl, CONTROL, SYNC_EVERY);
+    status->pps_bypass = M2SDR_GPS_BIT(ctl, CONTROL, PPS_BYPASS);
     status->time_sync_enable = (tctl >> CSR_TIME_GEN_CONTROL_SYNC_ENABLE_OFFSET) & 1u;
     status->baudrate   = (uint32_t)(((uint64_t)tw * sysclk + (1ull << 31)) >> 32);
 
@@ -2028,6 +2070,27 @@ int m2sdr_gps_clear_counters(struct m2sdr_dev *dev)
         return M2SDR_ERR_IO;
     return M2SDR_ERR_OK;
 #else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_gps_set_pps_bypass(struct m2sdr_dev *dev, bool bypass)
+{
+    M2SDR_GPS_REQUIRE(dev);
+#if defined(CSR_GPS_BASE)
+    uint32_t ctl = 0;
+    if (m2sdr_reg_read(dev, CSR_GPS_CONTROL_ADDR, &ctl) != 0)
+        return M2SDR_ERR_IO;
+    /* Never re-issue the pulse fields. */
+    ctl &= ~((1u << CSR_GPS_CONTROL_SYNC_ONCE_OFFSET) | (1u << CSR_GPS_CONTROL_CLEAR_OFFSET) |
+             (1u << CSR_GPS_CONTROL_PPS_BYPASS_OFFSET));
+    if (bypass)
+        ctl |= (1u << CSR_GPS_CONTROL_PPS_BYPASS_OFFSET);
+    if (m2sdr_reg_write(dev, CSR_GPS_CONTROL_ADDR, ctl) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)bypass;
     return M2SDR_ERR_UNSUPPORTED;
 #endif
 }

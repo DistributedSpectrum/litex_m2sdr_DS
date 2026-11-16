@@ -73,6 +73,12 @@ The M.2 breakout carries a Gateworks GW16143 (u-blox ZED-F9P) to the SDR: GPS UA
 
 Provision the F9P over its USB port first: NAV-TIMEUTC on UART1 at 115200 baud (the gateware default, `m2sdr_gps_set_baudrate()` changes it) and the timepulse on the UTC top of the second. Software control is in libm2sdr: `m2sdr_gps_get_status()`, `m2sdr_gps_set_sync()` (off, every PPS, or once), `m2sdr_gps_set_sync_offset()`. `pps_time_ns` (board time latched on every qualified PPS, before any sync) measures the board clock against GPS; `m2sdr_set_refclk_ppm()` trims it.
 
+**PPS bypass.** `m2sdr_gps_set_pps_bypass(dev, true)` (or `m2sdr_util gps-pps-bypass on`) makes the GPS core ignore the PPS pin: no PPS is qualified, latched, counted or used to sync, so the board time free-runs while UBX decoding continues. Use it when the PPS line is missing, noisy or not trusted. It is off after power-up or a reload, survives re-opening the device, and shows in `gps-status`. The `pps_in` CSRs keep watching the pin, so you can still see whether edges arrive. The bladeRF_DS gps_uart image (FPGA v0.19.1) has the same switch (`bladerf_set_gps_pps_bypass()`, `bladeRF-cli set gps_pps_bypass 1`).
+
+## Gateware Version
+
+The capability block reports the gateware release, the litex_m2sdr commit it was built from (with a dirty flag), and the build time: `m2sdr_get_gateware_version()`, `m2sdr_util info` ("Gateware Version"), and the ds service log. Releases start at v1.1.0 (`GATEWARE_VERSION` in `gateware/capability.py`). Every change bumps the patch number only. Compare versions as integers with `M2SDR_GATEWARE_VERSION(major, minor, patch)`. Images built before the register existed report `known = false`; their build date is still in the SoC identifier.
+
 ## User LED Behavior
 
 The board exposes a single monochrome `user_led`, so the gateware uses it as a layered status indicator rather than a simple on/off flag:

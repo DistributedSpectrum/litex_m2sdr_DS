@@ -1228,6 +1228,56 @@ static uint32_t icap_read(void *conn, uint32_t reg)
     return m2sdr_read32(conn, CSR_ICAP_DATA_ADDR);
 }
 
+/* GPS time input (gateware --with-gps) */
+/*--------------------------------------*/
+
+static int gps_status(void)
+{
+    struct m2sdr_dev *conn = m2sdr_open_dev();
+    struct m2sdr_gps_status st;
+    int rc = m2sdr_gps_get_status(conn, &st);
+    if (rc != M2SDR_ERR_OK) {
+        fprintf(stderr, "gps-status: %s\n", m2sdr_strerror(rc));
+        m2sdr_close_dev(conn);
+        return 1;
+    }
+    printf("PPS bypass     : %s\n", st.pps_bypass ? "on (PPS pin ignored)" : "off");
+    printf("PPS alive      : %s (qualified %u, rejected %u, without UTC %u)\n",
+           st.pps_alive ? "yes" : "no", st.pps_count, st.pps_rejected, st.pps_no_utc);
+    printf("UTC            : valid %s, fresh %s, epoch %llu, tAcc %u ns (%u frames, %u bad checksums)\n",
+           st.utc_valid ? "yes" : "no", st.utc_fresh ? "yes" : "no",
+           (unsigned long long)st.epoch, st.t_acc_ns, st.msg_count, st.ck_errors);
+    printf("Sync           : %s%s, time_gen sync %s, %u applied, last S %llu, offset %u ns\n",
+           st.sync_every ? "every PPS" : (st.once_armed ? "once (armed)" : "off"),
+           st.synced ? ", last PPS synced" : "", st.time_sync_enable ? "enabled" : "disabled",
+           st.sync_count, (unsigned long long)st.sync_epoch, st.sync_offset_ns);
+    printf("UART           : %u baud\n", st.baudrate);
+    m2sdr_close_dev(conn);
+    return 0;
+}
+
+static int gps_pps_bypass(const char *arg)
+{
+    bool on;
+    if (!strcmp(arg, "on") || !strcmp(arg, "1"))
+        on = true;
+    else if (!strcmp(arg, "off") || !strcmp(arg, "0"))
+        on = false;
+    else {
+        fprintf(stderr, "gps-pps-bypass: expected on or off, got '%s'\n", arg);
+        return 1;
+    }
+    struct m2sdr_dev *conn = m2sdr_open_dev();
+    int rc = m2sdr_gps_set_pps_bypass(conn, on);
+    m2sdr_close_dev(conn);
+    if (rc != M2SDR_ERR_OK) {
+        fprintf(stderr, "gps-pps-bypass: %s\n", m2sdr_strerror(rc));
+        return 1;
+    }
+    printf("GPS PPS bypass %s\n", on ? "on: the PPS pin is ignored" : "off: the PPS pin is used");
+    return 0;
+}
+
 static void info(void)
 {
     unsigned char soc_identifier[256];
@@ -1246,6 +1296,25 @@ static void info(void)
         exit(1);
     }
     printf("SoC Identifier   : %s.\n", soc_identifier);
+    {
+        struct m2sdr_gateware_version gw;
+        if (m2sdr_get_gateware_version(conn, &gw) == M2SDR_ERR_OK) {
+            if (gw.known) {
+                char when[32] = "unknown";
+                if (gw.build_time) {
+                    time_t bt = (time_t)gw.build_time;
+                    struct tm tm_utc;
+                    if (gmtime_r(&bt, &tm_utc))
+                        strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S UTC", &tm_utc);
+                }
+                printf("Gateware Version : %u.%u.%u (git %08x%s, built %s)\n",
+                       gw.major, gw.minor, gw.patch, gw.git_hash,
+                       gw.git_dirty ? "-dirty" : "", when);
+            } else {
+                printf("Gateware Version : unversioned (image predates v1.1.0)\n");
+            }
+        }
+    }
 
 #ifdef CSR_CAPABILITY_BASE
     struct m2sdr_capabilities caps;
@@ -4267,6 +4336,10 @@ static void help(void)
            "      Read an FPGA register.\n"
            "  reg-write OFFSET VALUE\n"
            "      Write an FPGA register.\n"
+           "  gps-status\n"
+           "      Show the GPS time input (gateware built with --with-gps).\n"
+           "  gps-pps-bypass on|off\n"
+           "      Ignore (on) or use (off) the GPS PPS pin for board time.\n"
            "  agc-status\n"
            "      Show RF_EN_AGC pin state and FPGA AGC saturation counters.\n"
            "  agc-counter DETECTOR THRESHOLD [enable|disable]\n"
@@ -4554,6 +4627,15 @@ int main(int argc, char **argv)
         list_devices();
     else if (cmd_is(cmd, "info", "show-info"))
         info();
+    else if (cmd_is(cmd, "gps_status", "gps-status"))
+        return gps_status();
+    else if (cmd_is(cmd, "gps_pps_bypass", "gps-pps-bypass")) {
+        if (!have_args(optind, argc, 1)) {
+            fprintf(stderr, "gps-pps-bypass: expected on or off\n");
+            return 1;
+        }
+        return gps_pps_bypass(argv[optind++]);
+    }
 
     /* PTP cmds. */
     else if (cmd_is(cmd, "ptp_status", "ptp-status"))

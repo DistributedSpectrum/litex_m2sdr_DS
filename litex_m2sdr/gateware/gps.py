@@ -19,6 +19,12 @@
 #   time sync with seconds = S: board time becomes (S + 1) * 1e9 + sync_offset ns at the edge
 #   that starts second S + 1. Every RX header timestamp is then GPS UTC in ns.
 #   Sync modes: off (default), every PPS, or once (armed by a CSR pulse).
+# - PPS bypass (control.pps_bypass, host-set, off at reset): ignore the PPS pin. No PPS is
+#   qualified, latched or counted, so nothing syncs and the board time free-runs; UBX decoding
+#   carries on, so utc_valid/epoch still show what the receiver says. For a PPS line that is
+#   missing, noisy or not trusted (indoors, a floating return, crosstalk). PPSInput (pps_in CSRs)
+#   still watches the pin, so software can see whether edges arrive while bypassed. The bladeRF_DS
+#   gps_uart image has the same switch (NIOS 8x32 target GPS_PPS_BYPASS).
 # - Latch the board time on each qualified PPS (before any sync), so software can measure the
 #   board clock against GPS (consecutive latches while free-running, or the step size while
 #   syncing every second) and trim it (m2sdr_set_refclk_ppm disciplines the SI5351, which clocks
@@ -334,6 +340,8 @@ class GPSTime(LiteXModule):
             CSRField("sync_once",  size=1, offset=2, pulse=True,
                 description="Arm one sync on the next such PPS."),
             CSRField("clear",      size=1, offset=3, pulse=True, description="Clear the counters."),
+            CSRField("pps_bypass", size=1, offset=4, reset=0,
+                description="Ignore the PPS pin: no PPS is qualified, latched, counted or used to sync."),
         ], description="GPS time control. The TimeGenerator's control.sync_enable must also be set for syncs to apply.")
         self._tuning_word = CSRStorage(32, reset=default_tuning_word,
             description=f"UART tuning word: round(baud / sys_clk_freq * 2**32) ({baudrate} baud at reset).")
@@ -347,6 +355,7 @@ class GPSTime(LiteXModule):
             CSRField("pending",   size=1, offset=3, description="A valid decode is waiting for the next PPS."),
             CSRField("synced",    size=1, offset=4, description="The last qualified PPS applied a sync."),
             CSRField("once_armed", size=1, offset=5, description="A one-shot sync is armed."),
+            CSRField("pps_bypass", size=1, offset=6, description="The PPS pin is being ignored (control.pps_bypass)."),
         ])
         self._epoch     = CSRStatus(64, description="UTC seconds of the last valid NAV-TIMEUTC decode.")
         self._t_acc     = CSRStatus(32, description="tAcc (ns) of the last good frame.")
@@ -364,6 +373,14 @@ class GPSTime(LiteXModule):
 
         enable = self._control.fields.enable
         clear  = self._control.fields.clear
+        # Qualified PPS after the bypass: every consumer below uses these, never pps.pulse.
+        pps_bypass   = self._control.fields.pps_bypass
+        pps_pulse    = Signal()
+        pps_rejected = Signal()
+        self.comb += [
+            pps_pulse.eq(pps.pulse & ~pps_bypass),
+            pps_rejected.eq(pps.rejected & ~pps_bypass),
+        ]
         # One-shot arm: the CSR pulse, or this input for other gateware.
         self.sync_once = Signal()
         sync_once = Signal()
@@ -376,7 +393,7 @@ class GPSTime(LiteXModule):
         pps_age = Signal(max=pps_alive_cycles + 1, reset=pps_alive_cycles)
         utc_age = Signal(max=utc_fresh_cycles + 1, reset=utc_fresh_cycles)
         self.sync += [
-            If(pps.pulse & enable, pps_age.eq(0)).Elif(pps_age != pps_alive_cycles, pps_age.eq(pps_age + 1)),
+            If(pps_pulse & enable, pps_age.eq(0)).Elif(pps_age != pps_alive_cycles, pps_age.eq(pps_age + 1)),
             If(decoder.decoded & decoder.utc_valid & enable, utc_age.eq(0)).Elif(utc_age != utc_fresh_cycles, utc_age.eq(utc_age + 1)),
         ]
 
@@ -407,12 +424,12 @@ class GPSTime(LiteXModule):
         # then holds until well past the next one: it is settled in the time domain long before
         # a sync pulse arrives there.
         self.comb += sync_seconds.eq(epoch)
-        self.comb += do_sync.eq(enable & pps.pulse & pending &
+        self.comb += do_sync.eq(enable & pps_pulse & pending &
             (self._control.fields.sync_every | once_armed))
         self.sync += [
             time_sync.eq(do_sync),
             If(sync_once, once_armed.eq(1)),
-            If(enable & pps.pulse,
+            If(enable & pps_pulse,
                 pps_time.eq(time_gen.time),
                 synced.eq(do_sync),
                 If(do_sync,
@@ -424,7 +441,7 @@ class GPSTime(LiteXModule):
             # same cycle as the PPS belongs to the second that PPS starts, so it stays pending.
             If(decoder.decoded & enable & decoder.utc_valid,
                 pending.eq(1),
-            ).Elif(pps.pulse & enable,
+            ).Elif(pps_pulse & enable,
                 pending.eq(0),
             ),
         ]
@@ -434,10 +451,10 @@ class GPSTime(LiteXModule):
             self.sync += If(clear, csr.status.eq(0)).Elif(event, csr.status.eq(csr.status + 1))
         counter(self._msg_count,    enable & decoder.decoded)
         counter(self._ck_errors,    enable & decoder.ck_error)
-        counter(self._pps_count,    enable & pps.pulse)
-        counter(self._pps_rejected, enable & pps.rejected)
+        counter(self._pps_count,    enable & pps_pulse)
+        counter(self._pps_rejected, enable & pps_rejected)
         counter(self._sync_count,   do_sync)
-        counter(self._pps_no_utc,   enable & pps.pulse & ~pending)
+        counter(self._pps_no_utc,   enable & pps_pulse & ~pending)
 
         self.comb += [
             self._status.fields.utc_valid.eq(utc_valid),
@@ -446,6 +463,7 @@ class GPSTime(LiteXModule):
             self._status.fields.pending.eq(pending),
             self._status.fields.synced.eq(synced),
             self._status.fields.once_armed.eq(once_armed),
+            self._status.fields.pps_bypass.eq(pps_bypass),
             self._epoch.status.eq(epoch),
             self._pps_time.status.eq(pps_time),
             self._sync_epoch.status.eq(sync_epoch),

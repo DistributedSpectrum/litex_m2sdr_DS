@@ -278,3 +278,67 @@ def test_gps_time_sync_once_and_off():
     assert st["armed"] == 1
     assert st["sync"] == 1
     assert syncs == [utc_epoch(2026, 1, 2, 3, 4, 5)]
+
+def test_gps_time_pps_bypass_ignores_the_pin():
+    """control.pps_bypass: PPS edges are not qualified, latched, counted or used to sync, while
+    UBX decoding carries on; clearing the bypass resumes syncing on the next PPS."""
+    dut = GPSDUT()
+    syncs = []
+    st = {}
+    frame = ubx_timeutc_frame(2026, 11, 16, 17, 0, 0)
+
+    def feed_decode():
+        for b in frame:
+            yield from uart_byte(dut.uart.rx, b, 16)
+        for _ in range(20):
+            yield
+
+    def pps_pulse():
+        yield dut.pps.eq(1)
+        for _ in range(40):
+            yield
+        yield dut.pps.eq(0)
+        for _ in range(400):
+            yield
+
+    def gen():
+        yield dut.uart.rx.eq(1)
+        # enable + sync_every + pps_bypass.
+        yield from dut.gps._control.write(0b10011)
+        yield dut.tg.time.eq(777)
+        for _ in range(3):
+            yield from feed_decode()
+            yield from pps_pulse()
+        st["bypass_status"] = (yield dut.gps._status.fields.pps_bypass)
+        st["bypass_msg"]    = (yield dut.gps._msg_count.status)
+        st["bypass_pps"]    = (yield dut.gps._pps_count.status)
+        st["bypass_rej"]    = (yield dut.gps._pps_rejected.status)
+        st["bypass_sync"]   = (yield dut.gps._sync_count.status)
+        st["bypass_alive"]  = (yield dut.gps._status.fields.pps_alive)
+        st["bypass_ppst"]   = (yield dut.gps._pps_time.status)
+        st["bypass_utc"]    = (yield dut.gps._status.fields.utc_valid)
+        # Bypass off: the next PPS after a decode syncs again.
+        yield from dut.gps._control.write(0b00011)
+        yield from feed_decode()
+        yield from pps_pulse()
+        st["status_after"] = (yield dut.gps._status.fields.pps_bypass)
+        st["pps_after"]    = (yield dut.gps._pps_count.status)
+        st["sync_after"]   = (yield dut.gps._sync_count.status)
+        st["ppst_after"]   = (yield dut.gps._pps_time.status)
+
+    @passive
+    def mon_time():
+        while True:
+            if (yield dut.tg.time_sync):
+                syncs.append((yield dut.tg.time_seconds))
+            yield
+
+    run_simulation(dut, {"sys": [gen()], "time": [mon_time()]}, clocks={"sys": 10, "time": 12})
+    assert st["bypass_status"] == 1
+    assert st["bypass_msg"] == 3 and st["bypass_utc"] == 1   # UBX still decoded.
+    assert st["bypass_pps"] == 0 and st["bypass_rej"] == 0   # The pin was ignored...
+    assert st["bypass_sync"] == 0 and st["bypass_alive"] == 0
+    assert st["bypass_ppst"] == 0                            # ...and nothing latched.
+    assert st["status_after"] == 0
+    assert st["pps_after"] == 1 and st["sync_after"] == 1 and st["ppst_after"] == 777
+    assert syncs == [utc_epoch(2026, 11, 16, 17, 0, 0)]

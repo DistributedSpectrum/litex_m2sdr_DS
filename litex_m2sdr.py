@@ -11,6 +11,7 @@ import os
 import sys
 import argparse
 import subprocess
+import time
 
 from migen import *
 
@@ -50,6 +51,21 @@ from litescope import LiteScopeAnalyzer
 from litex_m2sdr import Platform, _io_baseboard
 
 from litex_m2sdr.gateware.capability       import Capability
+
+# Gateware build provenance ------------------------------------------------------------------------
+
+def gateware_git_revision():
+    """(first 8 hex digits of HEAD as an int, tree dirty) of this repository; (0, False) when git
+    or the repository is unavailable (e.g. a source tarball)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        rev = subprocess.check_output(["git", "-C", here, "rev-parse", "--short=8", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True).strip()
+        dirty = subprocess.check_output(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL, text=True).strip() != ""
+        return int(rev[:8], 16), dirty
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0, False
 from litex_m2sdr.gateware.clock_discipline import MMCMPhaseDiscipline, PTPClock10Discipline
 from litex_m2sdr.gateware.si5351           import SI5351
 from litex_m2sdr.gateware.ad9361.core import AD9361RFIC
@@ -440,6 +456,7 @@ class BaseSoC(SoCMini):
         # Capability -------------------------------------------------------------------------------
 
         capability_wr_sfp = 0 if wr_sfp is None else wr_sfp
+        git_hash, git_dirty = gateware_git_revision()
         self.capability = Capability(
             # API Version.
             api_version_str = "1.0",
@@ -482,6 +499,11 @@ class BaseSoC(SoCMini):
             jtagbone       = with_jtagbone,
             eth_sfp        = eth_sfp,
             wr_sfp         = capability_wr_sfp,
+
+            # Gateware release + build provenance (capability gateware_version/git_hash/build_*).
+            git_hash       = git_hash,
+            git_dirty      = git_dirty,
+            build_time     = int(os.environ.get("SOURCE_DATE_EPOCH", time.time())),
         )
 
         # SI5351 Clock Generator -------------------------------------------------------------------
