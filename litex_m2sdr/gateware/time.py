@@ -65,6 +65,23 @@ class TimeGenerator(LiteXModule):
             adjust_with_underflow.eq(self.discipline_adjust_sign & (time < self.discipline_adjustment)),
         ]
 
+        # Time Sync value, computed ahead. It only depends on quasi-static inputs (the GPS seconds
+        # bus settles tens of ms before a sync pulse, the offset is a CSR), so an always-running
+        # pipeline computes it instead of the pulse's cycle: the 41-bit x 1e9 multiply and the 64-bit
+        # add do not fit one 100 MHz cycle (-0.4 ns with the GPS core). The extra product stage lets
+        # the DSPs use their internal registers. A sync pulse still loads the time in its own cycle,
+        # so the PPS -> time latency (and time_sync_offset) is unchanged.
+        sync_seconds_p1 = Signal(41)
+        sync_product    = Signal(64)
+        sync_product_r  = Signal(64)
+        sync_value      = Signal(64)
+        self.sync.time += [
+            sync_seconds_p1.eq(self.time_seconds + 1),
+            sync_product.eq(sync_seconds_p1 * int(1e9)),
+            sync_product_r.eq(sync_product),
+            sync_value.eq(sync_product_r + self.time_sync_offset),
+        ]
+
         # Time Handling (Q8.24 fractional ns).
         # Priority is explicit: reset, coarse write, PPS sync, bounded phase trim, then
         # normal fractional increment. The PTP discipline uses the same write/trim path
@@ -79,7 +96,7 @@ class TimeGenerator(LiteXModule):
                 frac.eq(0),
             # Time Sync.
             ).Elif(self.sync_enable & self.time_sync,
-                time.eq(((self.time_seconds + 1) * int(1e9)) + self.time_sync_offset),
+                time.eq(sync_value),
                 frac.eq(0),
             # External phase trim.
             ).Elif(self.discipline_adjust,

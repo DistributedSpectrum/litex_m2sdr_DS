@@ -148,3 +148,37 @@ def test_time_generator_external_discipline_write_and_adjust():
     assert samples["faster"] > 60
     assert samples["written"] >= 1_000_000
     assert samples["adjusted"] <= samples["written"] - 200
+
+
+def test_time_generator_pps_sync_loads_seconds_plus_one_at_the_pulse():
+    """time_sync loads (time_seconds + 1) * 1e9 + time_sync_offset in the pulse's own cycle (the
+    value is pipelined ahead from the quasi-static inputs, so the latency is unchanged)."""
+    dut = TimeGenerator(clk=ClockSignal("time"), clk_freq=100e6, with_csr=False)
+    seconds, offset = 1794847903, 357
+    samples = {}
+
+    def gen():
+        yield dut.enable.eq(1)
+        yield dut.sync_enable.eq(1)
+        yield dut.time_seconds.eq(seconds)
+        yield dut.time_sync_offset.eq(offset)
+        for _ in range(16):  # The inputs settle long before a pulse.
+            yield
+        samples["before"] = (yield dut.time)
+        yield dut.time_sync.eq(1)
+        yield
+        yield dut.time_sync.eq(0)
+        yield
+        samples["t0"] = (yield dut.time)  # The edge that samples the pulse has not reached the output yet.
+        yield
+        # Internal time loads on the edge that samples the pulse; the output register shows it one
+        # edge later, then the free-running increment continues from the loaded value.
+        samples["t1"] = (yield dut.time)
+        yield
+        samples["t2"] = (yield dut.time)
+
+    run_simulation(dut, gen(), clocks={"sys": 10, "time": 10})
+    expected = (seconds + 1) * 10**9 + offset
+    assert samples["before"] < expected and samples["t0"] < expected
+    assert samples["t1"] == expected
+    assert samples["t2"] == expected + 10  # 10 ns per 100 MHz cycle.
